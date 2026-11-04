@@ -38,9 +38,44 @@ GEN_PATHS = ("/v1/chat/completions", "/v1/completions", "/completion", "/chat/co
 LOAD_PHASES = ["starting", "reading tensors", "allocating/warming", "ready"]
 PHASE_RES = [
     (1, re.compile(r"load_model|llama_model_load|load_tensors|loading model tensors|llama_model_loader", re.I)),
-    (2, re.compile(r"offloaded\s+\d+\s*/\s*\d+\s+layers|llama_context|KV buffer size|compute buffer size|warming up|initializing slots", re.I)),
+    (2, re.compile(r"offloaded\s+\d+\s*/\s*\d+\s+layers|llama_context|KV buffer size|compute buffer size|warming up|initializing slots"
+                   r"|threadpool init|initializing, n_slots", re.I)),
     (3, re.compile(r"server is listening|ready after|all slots are idle", re.I)),
 ]
+
+
+def phase_of_line(line, cur=0):
+    """Load phase after one more log line (0..3); never goes back. Never raises."""
+    try:
+        hit = [i for i, rx in PHASE_RES if rx.search(line)]
+        return max([cur] + hit)
+    except Exception:  # noqa: BLE001
+        return cur
+
+
+def compute_placement(base, now, indices, rss_mib):
+    """Placement from resource growth: per profile GPU, max(0, mem_used_now - baseline) MiB (None when either
+    snapshot lacks the GPU); other GPUs are ignored. base/now are gpu_info() lists. Never raises."""
+    try:
+        bm = {g.get("index"): g for g in (base or []) if isinstance(g, dict)}
+        nm = {g.get("index"): g for g in (now or []) if isinstance(g, dict)}
+        devs = []
+        for i in indices or []:
+            b0, n0 = bm.get(i) or {}, nm.get(i) or {}
+            bu, nu = b0.get("mem_used"), n0.get("mem_used")
+            mib = max(0, nu - bu) if isinstance(bu, (int, float)) and isinstance(nu, (int, float)) else None
+            devs.append({"index": i, "name": n0.get("name") or b0.get("name"), "mib": mib})
+        known = [d["mib"] for d in devs if d["mib"] is not None]
+        gpu_total = sum(known) if known else None
+        host = rss_mib if isinstance(rss_mib, (int, float)) else None
+        total = (gpu_total or 0) + (host or 0) if (known or host is not None) else None
+        share = None
+        if gpu_total is not None and host is not None and gpu_total + host > 0:
+            share = round(100.0 * gpu_total / (gpu_total + host), 1)
+        return {"source": "vram-delta", "devices": devs, "host_mib": host, "total_mib": total,
+                "gpu_share_pct": share, "frozen": False}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def log(msg):
@@ -565,14 +600,17 @@ class Supervisor:
         self.load_bytes = 0
         self.load_pct = 0
         self.load_hist = collections.deque(maxlen=60)   # (t, bytes) for the recent MB/s
+        self.place_base = None        # gpu_info() snapshot taken just before the child launched
+        self.place_frozen = None      # placement copy taken when the state became ready
+        self.place_gpus_cache = (0.0, [])
 
     def _note_line(self, proc, line):
         try:
-            hit = [i for i, rx in PHASE_RES if rx.search(line)]
-            if hit:
+            ph = phase_of_line(line)
+            if ph:
                 with self.lock:
                     if self.proc is proc and self.state == "starting":
-                        self.load_phase = max(self.load_phase, min(max(hit), 2))   # ready comes from the health check
+                        self.load_phase = max(self.load_phase, min(ph, 2))   # ready comes from the health check
         except Exception:  # noqa: BLE001
             pass
 
@@ -628,6 +666,56 @@ class Supervisor:
         except Exception:  # noqa: BLE001
             pass
         return out
+
+    def placement_info(self, gpus=None, stats=None):
+        """Placement from VRAM growth since the profile started (see compute_placement). While starting or running
+        it is live; once ready the frozen copy is the headline and the live numbers sit under `live`. None when
+        nothing was ever launched. Never raises."""
+        try:
+            with self.lock:
+                st, base, frozen = self.state, self.place_base, self.place_frozen
+                idx, pid = list(self.running_gpus), (self.proc.pid if self.proc else None)
+            if base is None:
+                return None
+            live = None
+            if st in ("starting", "running"):
+                if gpus is None:
+                    t, cached = self.place_gpus_cache
+                    if time.time() - t < 2:
+                        gpus = cached
+                    else:
+                        gpus = gpu_info()
+                        self.place_gpus_cache = (time.time(), gpus)
+                rss = (stats or proc_stats(pid)).get("rss_mib")
+                live = compute_placement(base, gpus, idx, rss)
+            if frozen:
+                out = dict(frozen)
+                out["live"] = live
+                return out
+            return live
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _freeze_placement(self):
+        try:
+            with self.lock:
+                if self.place_base is None or self.place_frozen:
+                    return
+            p = self.placement_info(gpus=gpu_info())
+            if p:
+                p["frozen"] = True
+                with self.lock:
+                    self.place_frozen = p
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _placement_compact(self):
+        p = self.placement_info()
+        if not p:
+            return None
+        return {"source": p["source"], "total_mib": p["total_mib"], "host_mib": p["host_mib"],
+                "gpu_share_pct": p["gpu_share_pct"], "frozen": p["frozen"],
+                "gpu_mib": [d["mib"] for d in p["devices"]]}
 
     # -- generation stats (counted from the SSE chunks that pass through the proxy; one chunk ~ one token)
     def gen_begin(self):
@@ -748,6 +836,10 @@ class Supervisor:
             self.logs.append(f"[ctl] starting profile {prof['name']} on GPUs {gpus or 'none'} CPUs {cpus or 'unpinned'}")
             self.logs.append("[ctl] " + " ".join(shlex.quote(c) for c in cmd).replace(self.internal_key, "***"))
             try:
+                place_base = gpu_info() if gpus else []     # baseline VRAM before the child allocates anything
+            except Exception:  # noqa: BLE001
+                place_base = []
+            try:
                 self.proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              stdin=subprocess.DEVNULL, start_new_session=True, bufsize=1, text=True,
                                              errors="replace")
@@ -759,6 +851,7 @@ class Supervisor:
             self.running_profile, self.running_cmd, self.running_gpus = prof, cmd, gpus
             self.running_cpus = cpus or []
             self._load_reset(prof["model"])
+            self.place_base = place_base
             self.last_activity = time.time()
             self.ready_event.clear()
             proc = self.proc
@@ -839,6 +932,7 @@ class Supervisor:
                             self.state, self.ready_at = "running", time.time()
                             self.last_activity = time.time()
                             self.logs.append(f"[ctl] ready after {self.ready_at - self.started_at:.0f}s")
+                    self._freeze_placement()
                     self.ready_event.set()
                     return
             except OSError:
@@ -919,6 +1013,7 @@ class Supervisor:
                 "restart_needed": stale,
                 "load": self.load_info(),
                 "gen": self.gen_info(),
+                "placement": self._placement_compact(),
             }
 
 
@@ -1261,10 +1356,12 @@ class Sampler:
             pass
         mem = meminfo(pid)
         ids, busy = self._cpu_busy()
+        gpus = gpu_info()
+        self.sup.place_gpus_cache = (time.time(), gpus)
         return {"t": round(time.time(), 2),
                 "ram_used": mem["used_mib"], "ram_cached": mem["cached_mib"], "ram_free": mem["free_mib"],
                 "nodes": [n["used_mib"] for n in mem["nodes"]],
-                "gpus": [[g["index"], g["mem_used"], g["util"]] for g in gpu_info()],
+                "gpus": [[g["index"], g["mem_used"], g["util"]] for g in gpus],
                 "cpu": busy, "rss": mem["child"]["rss_mib"], "read_bytes": mem["child"]["read_bytes"],
                 "load": self._safe("load_info", mem["child"]), "gen": self._safe("gen_info")}
 
@@ -1419,7 +1516,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             gp = list(sup.running_gpus)
             for d in lm["devices"]:
                 d["gpu"] = gp[d["index"]] if d.get("index") is not None and d["index"] < len(gp) else None
-            lm.update(state=sup.state, running_gpus=gp)
+            lm.update(state=sup.state, running_gpus=gp, placement=sup.placement_info())
             return self.send_json(lm)
         if path == "/api/metrics" and method == "GET":
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
