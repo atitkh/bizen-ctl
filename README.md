@@ -89,6 +89,14 @@ RAM note: "available" counts reclaimable page cache, and an mmap'd model *is* pa
 - `POST /api/chat` with `{messages, max_tokens?, temperature?}`: streams `text/event-stream`. Starts with `data: {"bizen":"loading"}` keepalives while the model loads, then `{"bizen":"ready"}`, then llama-server's own chat-completion chunks, then `[DONE]`. Errors arrive in-stream as `data: {"error": ...}`. Closing the connection stops generation.
 - `GET /api/status` keeps its shape; `mem` gained `used_mib`, `free_mib`, `buffers_mib`, `cached_mib`, `swap_*`, `nodes[]`, `cgroup` and `child` (`rss_mib`, `read_bytes`).
 
+### Model load and Generation panels (Dashboard tab)
+
+- **Model load**: progress bar with MB/s and ETA, phase chips (starting, reading tensors, allocating/warming, ready), a stacked bar per device (weights / KV / compute) for each GPU and the host (CPU) buffer, and a one-row layer strip coloured by device when the log prints per-layer assignments. Idle shows a calm "no model loading" state and the last load summary stays after ready. The **Logs** tab has a *Download startup log* button (text of the current log from the last `starting profile` line).
+- **Generation**: live tok/s, a 3-minute tok/s sparkline, and a per-GPU utilisation strip (time on x, shaded by util %, generation-active spans marked above). Tokens are counted from streamed SSE chunks passing through `/v1` and `/api/chat` (one chunk ~ one token), so no `--metrics` flag or `/slots` is needed.
+- `GET /api/status` gained `server.load` = `{phase, bytes_read, bytes_total, pct, eta_s, mbps}` (shard-aware model size; `bytes_read` from the child's `/proc/<pid>/io` `rchar`, which is what `--load-mode none` does, with an RSS-growth fallback for mmap; `pct` is monotonic and capped at 99 until ready) and `server.gen` = `{active, tokens, ttft_s, tps, last_tps}`. Both are also on every `/api/metrics` sample.
+- `GET /api/loadmap` (login required): `{profile, state, layers_total, layers_offloaded, devices:[{name, weights_mib, kv_mib, compute_mib}], cpu_mib, per_layer:[{layer, device}], fit:{raw:[...]}}` parsed from the startup log. Every pattern is optional, so a build that prints less just gives fewer fields. `test/fixtures/startup-q3.log` is a SYNTHETIC illustration of llama.cpp's format, not a real log; replace it with a real startup log when you have one.
+- Not verified on the real box: llama.cpp's actual log wording for this build, `rchar` behaviour on the NAS mount, browser rendering.
+
 ## Notes
 
 - llama-server itself listens only on 127.0.0.1 with a random internal key. All outside access goes through the controller.

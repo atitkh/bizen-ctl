@@ -90,6 +90,12 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
+for U in test_loadmap test_gen; do
+  python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
+  grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
+  grep "^FAIL" "$T/$U.log" | head -5
+  ok "$U exits 0" $([ $UR = 0 ] && echo 1 || echo 0)
+done
 echo "--- status.mem has the extended fields"
 curl -s -b "$T/jar" $B/api/status | j "m=d['mem'];print('mem ok' if all(k in m for k in ('total_mib','available_mib','used_mib','free_mib','buffers_mib','cached_mib','swap_used_mib','nodes','child')) and m['used_mib']==m['total_mib']-m['available_mib'] else 'mem MISSING: '+str(sorted(m)))" | tee "$T/o"
 ok "status.mem extended" $(grep -q "^mem ok" "$T/o" && echo 1 || echo 0)
@@ -136,6 +142,9 @@ ok "chat ends with [DONE]" $(grep -q "^done True" "$T/o" && echo 1 || echo 0)
 ok "chat chunks arrive incrementally (not buffered)" $(python3 -c "print(1 if float(open('$T/o').read().split('spread ')[1].split()[0])>=0.4 else 0)")
 curl -sN -b "$T/jar" -X POST -d '{"messages":[{"role":"user","content":"hi"}]}' $B/api/chat | head -c 4000 > "$T/chat.raw"
 ok "chat sends ready event before tokens" $(grep -q '"bizen": "ready"' "$T/chat.raw" && echo 1 || echo 0)
+echo "--- server.gen after the streamed chats above"
+curl -s -b "$T/jar" $B/api/status | j "g=d['server']['gen'];print('genend',g['active'],g['tokens'],g['tps'],g['last_tps'] is not None and g['last_tps']>0)" | tee "$T/o"
+ok "gen after streams: inactive, last_tps recorded" $(grep -q "^genend False None None True" "$T/o" && echo 1 || echo 0)
 echo "--- chat cold start shows loading events"
 curl -s -b "$T/jar" -X POST $B/api/stop >/dev/null; sleep 3
 curl -sN -b "$T/jar" -X POST -d '{"messages":[{"role":"user","content":"hi"}]}' $B/api/chat | head -c 4000 > "$T/chat.cold"
@@ -157,6 +166,41 @@ CHILD=$(curl -s -b "$T/jar" $B/api/status | j "print(d['server']['pid'])")
 kill $CTL; sleep 2
 if kill -0 "$CHILD" 2>/dev/null; then echo "LEAKED CHILD $CHILD"; kill "$CHILD"; else echo "child $CHILD stopped"; fi
 if [ "$KCHILD" != "None" ] && kill -0 "$KCHILD" 2>/dev/null; then echo "LEAKED KEV $KCHILD"; kill "$KCHILD"; else echo "kev child stopped"; fi
+echo "--- second controller: load progress and /api/loadmap (slow mock load with the fixture log)"
+head -c 20000000 /dev/zero > "$T/model-big.gguf"
+python3 - "$T/config.json" "$T/config2.json" <<'EOF3'
+import json,sys
+c=json.load(open(sys.argv[1])); c.update(listen_port=18993, internal_port=18994, idle_ttl_min=0)
+c["kev"]=dict(c["kev"], managed=False); c["router"]=dict(c["router"], enabled=False)
+for p in c["profiles"]: p["model"]=sys.argv[1].rsplit("/",1)[0]+"/model-big.gguf"
+json.dump(c,open(sys.argv[2],"w"))
+EOF3
+B2=http://127.0.0.1:18993
+MOCK_TOKENS=6 MOCK_LOAD_S=8 MOCK_LOG="$D/test/fixtures/startup-q3.log" python3 -u "$D/bizenctl.py" --config "$T/config2.json" > "$T/ctl2.log" 2>&1 &
+CTL2=$!; sleep 1
+curl -s -c "$T/jar2" -X POST -d '{"password":"pw"}' $B2/api/login >/dev/null
+curl -s -b "$T/jar2" -X POST $B2/api/start >/dev/null; sleep 3
+curl -s -b "$T/jar2" $B2/api/status | j "l=d['server']['load'];print('loadmid',d['server']['state'],sorted(l)==sorted(['phase','bytes_read','bytes_total','pct','eta_s','mbps','source']),l['pct'] is not None and 0<=l['pct']<=99,l['phase'])" | tee "$T/o"
+ok "server.load while loading: fields present, pct in 0..99" $(grep -q "^loadmid starting True True" "$T/o" && echo 1 || echo 0)
+ok "/api/loadmap needs login" $([ "$(curl -s -o /dev/null -w %{http_code} $B2/api/loadmap)" = 401 ] && echo 1 || echo 0)
+sleep 7
+curl -s -b "$T/jar2" $B2/api/status | j "l=d['server']['load'];print('loadend',d['server']['state'],l['phase'],l['pct'])" | tee "$T/o"
+ok "server.load when running: ready, 100" $(grep -q "^loadend running ready 100" "$T/o" && echo 1 || echo 0)
+curl -s -b "$T/jar2" $B2/api/loadmap | j "print('loadmap',d['state'],d['layers_total'],d['layers_offloaded'],len(d['devices']),len(d['per_layer']),d['have_data'],'gpu' in d['devices'][0] if d['devices'] else False)" | tee "$T/o"
+ok "/api/loadmap shape on the fixture log" $(grep -q "^loadmap .* 44 24 4 43 True True" "$T/o" && echo 1 || echo 0)
+echo "--- server.gen during and after a streamed /api/chat (6 extra mock tokens)"
+( curl -sN -b "$T/jar2" -X POST -d '{"messages":[{"role":"user","content":"hi"}]}' $B2/api/chat > /dev/null ) &
+CP=$!
+sleep 1.2
+curl -s -b "$T/jar2" $B2/api/status | j "g=d['server']['gen'];print('genmid',g['active'],g['tokens'] is not None and g['tokens']>=1,g['ttft_s'] is not None,sorted(g)==sorted(['active','requests','tokens','ttft_s','tps','last_tps']))" | tee "$T/o"
+ok "gen mid-stream: active, tokens counted, ttft set, fields present" $(grep -q "^genmid True True True True" "$T/o" && echo 1 || echo 0)
+wait $CP; sleep 1.5
+curl -s -b "$T/jar2" $B2/api/status | j "g=d['server']['gen'];print('genend',g['active'],g['tokens'],g['tps'],g['last_tps'] is not None and g['last_tps']>0)" | tee "$T/o"
+ok "gen after stream: inactive, last_tps recorded" $(grep -q "^genend False None None True" "$T/o" && echo 1 || echo 0)
+curl -s -b "$T/jar2" "$B2/api/metrics" | j "print('genmetrics',all('gen' in x for x in d['samples']) and any(x['gen'] and x['gen']['active'] for x in d['samples']))" | tee "$T/o"
+ok "metrics samples carry gen, with an active span" $(grep -q "genmetrics True" "$T/o" && echo 1 || echo 0)
+kill $CTL2; sleep 2
+CH2=$(pgrep -f "config2.json" | head -1); [ -n "$CH2" ] && kill $CH2
 echo "--- controller log"; cat "$T/ctl.log"
 echo "--- result"; if [ "$FAILS" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; fi
 exit $([ "$FAILS" = 0 ] && echo 0 || echo 1)
