@@ -374,6 +374,76 @@ def model_total_bytes(path):
     except Exception:  # noqa: BLE001
         return None
 
+# -- startup log -> layer/buffer map (best effort; every pattern optional, builds differ)
+OFFLOAD_RE = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers", re.I)
+NLAYER_RE = re.compile(r"\bn_layer\s*=\s*(\d+)")
+BUF_RE = re.compile(r"(?:^|[\s:])([A-Za-z][\w.\-]*?)\s+(model|KV|compute|RS)\s+buffer size\s*=\s*([\d.]+)\s*(KiB|MiB|GiB|B)\b", re.I)
+LAYER_RE = re.compile(r"\blayer\s+(\d+)\s+assigned to device\s+([\w.\-]+?)(?=[,\s]|$)", re.I)
+FIT_RE = re.compile(r"params_fit|projected|n_layer|overflow|\bfit(?:ting|ted)?\b", re.I)
+HOSTLIKE_RE = re.compile(r"^(cpu|host)|_(host|mapped|repack)$", re.I)
+_UNIT = {"b": 1 / 1048576, "kib": 1 / 1024, "mib": 1.0, "gib": 1024.0}
+
+
+def parse_startup_log(lines):
+    """Parse llama-server startup output into {profile, layers_total, layers_offloaded, devices, cpu_mib, cpu,
+    per_layer, fit}. Looks only at the part after the last '[ctl] starting profile' line. Never raises; anything
+    not found stays None / empty."""
+    out = {"profile": None, "layers_total": None, "layers_offloaded": None, "devices": [], "cpu_mib": None,
+           "cpu": {"weights_mib": None, "kv_mib": None, "compute_mib": None},
+           "per_layer": [], "fit": {"raw": []}, "have_data": False}
+    try:
+        lines = [l for l in lines if isinstance(l, str)]
+        for i in range(len(lines) - 1, -1, -1):
+            m = re.search(r"\[ctl\] starting profile (\S+)", lines[i])
+            if m:
+                out["profile"], lines = m.group(1), lines[i + 1:]
+                break
+        bufs, layers, nlayer = {}, {}, None
+        for line in lines:
+            if line.startswith("[ctl]"):
+                continue
+            m = OFFLOAD_RE.search(line)
+            if m:
+                out["layers_offloaded"], out["layers_total"] = int(m.group(1)), int(m.group(2))
+            m = NLAYER_RE.search(line)
+            if m:
+                nlayer = int(m.group(1))
+            m = BUF_RE.search(line)
+            if m:
+                kind = {"model": "weights", "kv": "kv", "compute": "compute", "rs": "kv"}[m.group(2).lower()]
+                bufs[(m.group(1), kind)] = float(m.group(3)) * _UNIT[m.group(4).lower()]   # a re-print replaces
+            m = LAYER_RE.search(line)
+            if m:
+                layers[int(m.group(1))] = m.group(2)
+            if FIT_RE.search(line) and "print_info" not in line and len(out["fit"]["raw"]) < 12:
+                out["fit"]["raw"].append(line.strip()[:300])
+        if out["layers_total"] is None:
+            out["layers_total"] = nlayer
+        devs, cpu = {}, {"weights": 0.0, "kv": 0.0, "compute": 0.0}
+        seen_cpu = False
+        for (name, kind), mib in bufs.items():
+            if HOSTLIKE_RE.search(name):
+                cpu[kind] += mib
+                seen_cpu = True
+            else:
+                devs.setdefault(name, {"name": name, "weights_mib": None, "kv_mib": None, "compute_mib": None})[kind + "_mib"] = round(mib, 1)
+        def natural(d):
+            m = re.search(r"(\d+)$", d["name"])
+            return (d["name"].rstrip("0123456789"), int(m.group(1)) if m else -1)
+        out["devices"] = sorted(devs.values(), key=natural)
+        for d in out["devices"]:
+            m = re.search(r"(\d+)$", d["name"])
+            d["index"] = int(m.group(1)) if m else None
+        if seen_cpu:
+            out["cpu"] = {"weights_mib": round(cpu["weights"], 1), "kv_mib": round(cpu["kv"], 1), "compute_mib": round(cpu["compute"], 1)}
+            out["cpu_mib"] = round(sum(cpu.values()), 1)
+        out["per_layer"] = [{"layer": k, "device": layers[k]} for k in sorted(layers)]
+        out["have_data"] = bool(out["devices"] or seen_cpu or out["layers_offloaded"] is not None or layers or out["fit"]["raw"])
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 
 def cgroup_mem():
     """Container cgroup usage/limit (cgroup v2, then v1); None when unavailable."""
@@ -492,8 +562,9 @@ class Supervisor:
                         out["source"] = "held"
                     if not self.load_hist or now - self.load_hist[-1][0] >= 0.5:
                         self.load_hist.append((now, self.load_bytes))
-                out["bytes_read"] = self.load_bytes if cand else None
-                if total and cand:
+                known = bool(cand) or self.load_bytes > 0   # a transient /proc failure keeps the last numbers
+                out["bytes_read"] = self.load_bytes if known else None
+                if total and known:
                     p = int(100 * self.load_bytes / total)
                     if self.load_phase >= 2:
                         p = max(p, 95)       # "offloaded N/M layers" is printed once the tensors are in
@@ -1233,6 +1304,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "kev": self.server.kev.status(),
                 "router_enabled": self.server.router.enabled(),
             })
+        if path == "/api/loadmap" and method == "GET":
+            lm = parse_startup_log(list(sup.logs))
+            gp = list(sup.running_gpus)
+            for d in lm["devices"]:
+                d["gpu"] = gp[d["index"]] if d.get("index") is not None and d["index"] < len(gp) else None
+            lm.update(state=sup.state, running_gpus=gp)
+            return self.send_json(lm)
         if path == "/api/metrics" and method == "GET":
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try:
