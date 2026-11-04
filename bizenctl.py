@@ -1182,6 +1182,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/test" and method == "POST":
             d = self.json_body() or {}
             return self.test_prompt(str(d.get("prompt") or "Say hi in one sentence."))
+        if path == "/api/chat" and method == "POST":
+            return self.chat_stream()
         if path == "/api/kev/start" and method == "POST":
             threading.Thread(target=self.server.kev.start, daemon=True).start()
             return self.send_json({"ok": True})
@@ -1213,6 +1215,72 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=lambda: (time.sleep(0.5), os.kill(os.getpid(), signal.SIGTERM)), daemon=True).start()
             return
         return self.send_json({"error": "not found"}, 404)
+
+    def chat_stream(self):
+        """Admin chat: stream the child's /v1/chat/completions SSE back to the browser.
+        Headers go out first so the UI can show a loading state: while the model loads we send
+        `data: {"bizen":"loading",...}` keepalives, then `{"bizen":"ready"}`, then llama-server's chunks."""
+        d = self.json_body()
+        msgs = d.get("messages") if isinstance(d, dict) else None
+        if not isinstance(msgs, list) or not msgs or not all(
+                isinstance(m, dict) and isinstance(m.get("role"), str) and isinstance(m.get("content"), (str, list))
+                for m in msgs):
+            return self.send_json({"error": "messages must be a non-empty list of {role, content}"}, 400)
+        payload = {"messages": msgs, "stream": True, "stream_options": {"include_usage": True}}
+        try:
+            payload["max_tokens"] = max(1, min(int(d.get("max_tokens") or 1024), 131072))
+            if d.get("temperature") is not None:
+                payload["temperature"] = max(0.0, min(float(d["temperature"]), 5.0))
+        except (TypeError, ValueError):
+            return self.send_json({"error": "max_tokens/temperature must be numbers"}, 400)
+        sup = self.sup
+        sup.touch(+1)
+        c = None
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def emit(obj):
+                self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                self.wfile.flush()
+
+            res = {}
+            th = threading.Thread(target=lambda: res.update(ok=sup.ensure_ready(self.cfg.get("start_timeout_s"))), daemon=True)
+            th.start()
+            while th.is_alive():
+                emit({"bizen": "loading", "state": sup.state})
+                th.join(1.5)
+            if not res.get("ok"):
+                return emit({"error": sup.error or f"server not ready ({sup.state})"})
+            emit({"bizen": "ready", "profile": sup.serving()})
+            c = http.client.HTTPConnection("127.0.0.1", self.cfg.get("internal_port"), timeout=600)
+            c.request("POST", "/v1/chat/completions", body=json.dumps(payload),
+                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {sup.internal_key}"})
+            r = c.getresponse()
+            if r.status != 200:
+                return emit({"error": r.read()[:500].decode(errors="replace") or f"upstream status {r.status}"})
+            while True:
+                chunk = r.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                sup.last_activity = time.time()
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # browser hit Stop: closing the upstream connection below stops generation
+        except OSError as e:
+            try:
+                self.wfile.write(b"data: " + json.dumps({"error": f"upstream error: {e}"}).encode() + b"\n\n")
+            except OSError:
+                pass
+        finally:
+            if c:
+                c.close()
+            sup.touch(-1)
 
     def test_prompt(self, prompt, profile=None, decision=None):
         sup = self.sup

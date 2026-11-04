@@ -74,6 +74,13 @@
   .prob.top .bar i { background: var(--acc); }
   details { margin-top: 12px; }
   summary { cursor: pointer; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  #chatLog { height: 50vh; min-height: 260px; overflow: auto; background: #0b0e12; border: 1px solid var(--line); border-radius: 6px; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 88%; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: #11151b; }
+  .msg.user { align-self: flex-end; border-color: #35568a; background: #14202f; }
+  .msg .who { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px; }
+  .msg pre { font: 13.5px/1.5 system-ui, sans-serif; word-break: normal; overflow-wrap: anywhere; }
+  .msg .think { color: var(--dim); font-style: italic; border-left: 2px solid var(--line); padding-left: 8px; margin-bottom: 6px; }
+  .msg.err { border-color: var(--bad); color: var(--bad); }
   .gpugrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
   .gcard { background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-variant-numeric: tabular-nums; }
   .gcard.mine { border-color: #35568a; }
@@ -164,7 +171,25 @@
 
   </div>
   <div class="pane" id="pane-chat" data-tab="chat">
-  <section class="wide" id="chatPlaceholder"><h2>Chat</h2><div class="note">coming in the next step</div></section>
+  <section class="wide">
+    <h2>Chat <span class="sp"></span><span id="chatProfile" class="note" style="text-transform:none;letter-spacing:0"></span>
+      <button onclick="chatClear()">Clear</button></h2>
+    <div id="chatBanner" class="banner"></div>
+    <details id="chatSysBox"><summary style="margin-bottom:8px">System prompt &amp; sampling</summary>
+      <div class="grid3" style="margin-bottom:12px">
+        <div style="grid-column: 1 / -1"><label>System prompt (sent first, not shown in the log)</label><textarea id="chatSys" rows="2" placeholder="optional"></textarea></div>
+        <div><label>Max tokens</label><input id="chatMax" type="number" min="1" value="1024"></div>
+        <div><label>Temperature</label><input id="chatTemp" type="number" step="0.1" min="0" max="5" value="0.7"></div>
+      </div>
+    </details>
+    <div id="chatLog"></div>
+    <div id="chatStat" class="note" style="margin:8px 0">idle</div>
+    <div class="row" style="align-items:stretch">
+      <textarea id="chatIn" rows="3" style="flex:1" placeholder="Message the running profile (Enter sends, Shift+Enter = newline)"></textarea>
+      <div style="display:grid;gap:6px"><button class="primary" id="chatSend" onclick="chatSend()">Send</button>
+        <button class="danger" id="chatStop" onclick="chatStop()" disabled>Stop</button></div>
+    </div>
+  </section>
 
   </div>
   <div class="pane" id="pane-profiles" data-tab="profiles">
@@ -718,6 +743,111 @@ function renderGen() {
   $('kGen').textContent = s.state !== 'running' ? s.state : (s.inflight ? `generating ×${s.inflight}` : 'idle');
   $('kGen').className = s.inflight ? 's-running' : '';
 }
+
+/* ---- chat: streams /api/chat (SSE) ---- */
+let chatMsgs = [], chatAbort = null;
+function chatEl(m) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + m.role + (m.err ? ' err' : '');
+  d.innerHTML = `<div class="who">${m.role === 'user' ? 'you' : 'model'}</div><pre class="think" style="display:none"></pre><pre class="body"></pre>`;
+  m.el = d; chatFill(m);
+  return d;
+}
+function chatFill(m) {
+  const th = m.el.querySelector('.think');
+  th.style.display = m.reasoning ? 'block' : 'none'; th.textContent = m.reasoning || '';
+  m.el.querySelector('.body').textContent = m.content || '';
+}
+function chatScroll() { const b = $('chatLog'); b.scrollTop = b.scrollHeight; }
+function chatRenderAll() {
+  const b = $('chatLog'); b.innerHTML = '';
+  chatMsgs.forEach(m => b.appendChild(chatEl(m)));
+  chatScroll();
+}
+function chatClear() { if (chatAbort) chatAbort.abort(); chatMsgs = []; chatRenderAll(); $('chatStat').textContent = 'idle'; $('chatBanner').className = 'banner'; }
+function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; }
+function chatStop() { if (chatAbort) chatAbort.abort(); }
+function chatAdd(m) {
+  chatMsgs.push(m);
+  const b = $('chatLog'), near = b.scrollTop + b.clientHeight >= b.scrollHeight - 40;
+  b.appendChild(chatEl(m)); if (near || m.role === 'user') chatScroll();
+}
+tabHooks.chat = { show() { const p = status && status.server.profile; $('chatProfile').textContent = p ? 'profile: ' + p : 'model not loaded: first message starts it'; } };
+
+async function chatSend() {
+  const text = $('chatIn').value.trim();
+  if (!text || chatAbort) return;
+  $('chatIn').value = '';
+  const history = chatMsgs.filter(m => !m.err && !m.skip && m.content).map(m => ({ role: m.role, content: m.content }));
+  history.push({ role: 'user', content: text });
+  chatAdd({ role: 'user', content: text });
+  const am = { role: 'assistant', content: '', reasoning: '' };
+  chatAdd(am);
+  const sys = $('chatSys').value.trim();
+  const body = { messages: (sys ? [{ role: 'system', content: sys }] : []).concat(history),
+                 max_tokens: parseInt($('chatMax').value) || 1024, temperature: parseFloat($('chatTemp').value) };
+  if (isNaN(body.temperature)) delete body.temperature;
+  chatAbort = new AbortController(); chatBusy(true);
+  const ban = $('chatBanner'), stat = $('chatStat');
+  const t0 = performance.now(); let tReady = t0, tFirst = null, nTok = 0, finalTok = null, loadSeen = false, ticker = null;
+  const live = () => {
+    if (tFirst == null) return;
+    const secs = (performance.now() - tFirst) / 1000, n = finalTok != null ? finalTok : nTok;
+    stat.textContent = `TTFT ${((tFirst - tReady) / 1000).toFixed(2)} s · ${n} tokens · ${secs > 0.2 && n > 1 ? ((n - 1) / secs).toFixed(1) : '–'} tok/s`;
+  };
+  stat.textContent = 'sending…';
+  try {
+    const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: chatAbort.signal });
+    if (r.status === 401) { $('login').style.display = 'flex'; throw new Error('login required'); }
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || ('HTTP ' + r.status)); }
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '', done = false;
+    ticker = setInterval(live, 250);
+    while (!done) {
+      const { value, done: fin } = await rd.read();
+      if (fin) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+        for (const line of ev.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') { done = true; continue; }
+          let o; try { o = JSON.parse(data); } catch { continue; }
+          if (o.bizen === 'loading') {
+            loadSeen = true; ban.className = 'banner warn';
+            ban.textContent = `Model is loading (${o.state}) — a first start can take several minutes. ${Math.round((performance.now() - t0) / 1000)} s so far.`;
+            stat.textContent = 'waiting for the model…';
+          } else if (o.bizen === 'ready') {
+            ban.className = 'banner'; tReady = performance.now(); stat.textContent = loadSeen ? `loaded in ${Math.round((tReady - t0) / 1000)} s; generating…` : 'generating…';
+          } else if (o.error) {
+            throw new Error(typeof o.error === 'string' ? o.error : JSON.stringify(o.error));
+          } else {
+            const ch = o.choices && o.choices[0], dl = ch && ch.delta;
+            if (dl && (dl.content || dl.reasoning_content)) {
+              if (tFirst == null) tFirst = performance.now();
+              if (dl.content) am.content += dl.content;
+              if (dl.reasoning_content) am.reasoning += dl.reasoning_content;
+              nTok++; chatFill(am);
+              const lg = $('chatLog'); if (lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 60) chatScroll();
+            }
+            if (o.usage && o.usage.completion_tokens != null) finalTok = o.usage.completion_tokens;
+            if (o.timings && o.timings.predicted_per_second) finalTok = o.timings.predicted_n != null ? o.timings.predicted_n : finalTok;
+          }
+        }
+      }
+    }
+    live();
+  } catch (e) {
+    if (e.name === 'AbortError') { stat.textContent += ' · stopped'; if (!am.content) { am.content = '(stopped)'; am.skip = true; } }
+    else { am.err = true; am.el.classList.add('err'); am.content = (am.content ? am.content + '\n\n' : '') + 'Error: ' + e.message; stat.textContent = 'failed'; }
+    chatFill(am);
+  } finally {
+    clearInterval(ticker); ban.className = 'banner'; chatAbort = null; chatBusy(false);
+    if (!am.content && !am.reasoning) { am.content = '(no output)'; am.skip = true; chatFill(am); }
+  }
+}
+$('chatIn').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); chatSend(); } });
 
 /* ---- tabs: selected tab lives in location.hash ---- */
 const TABS = ['dashboard', 'chat', 'profiles', 'kev', 'logs', 'access'];
