@@ -817,6 +817,8 @@ function renderLoad() {
   }
   $('loadProg').innerHTML = prog;
   const m = loadMap, has = m && m.have_data && (m.devices.length || m.cpu_mib != null);
+  const pl = m && m.placement;
+  if (!has && pl && pl.devices) { renderPlacement(pl, s.state); return; }
   if (!has) { $('loadDevs').innerHTML = ''; $('loadLayers').innerHTML = ''; $('loadFit').style.display = (m && m.fit && m.fit.raw.length) ? '' : 'none'; renderFit(); return; }
   const rows = m.devices.map(d => ({ name: d.name, label: d.gpu != null ? `GPU ${d.gpu} <span class="note">${esc(d.name)}</span>` : esc(d.name), w: d.weights_mib || 0, k: d.kv_mib || 0, c: d.compute_mib || 0,
     cap: d.gpu != null ? ((status.gpus.find(g => g.index === d.gpu) || {}).mem_total || 0) : 0 }));
@@ -834,6 +836,24 @@ function renderLoad() {
       m.per_layer.map(x => `<i title="layer ${x.layer}: ${esc(x.device)}" style="background:${devCol(x.device)}"></i>`).join('') + '</div><div class="legend">' +
       names.map(n => `<span><i style="background:${devCol(n)}"></i>${esc(n)}</span>`).join('') + '</div>';
   } else $('loadLayers').innerHTML = '';
+  renderFit();
+}
+// no layer lines in the log: draw one bar per profile GPU from VRAM growth since start, plus the host (child RSS)
+function renderPlacement(pl, st) {
+  const caps = i => ((status.gpus.find(g => g.index === i) || {}).mem_total || 0);
+  const rows = pl.devices.map(d => ({ label: `GPU ${d.index} <span class="note">${esc(d.name || '')}</span>`, v: d.mib, cap: caps(d.index), c: 'var(--acc)' }));
+  if (pl.host_mib != null) rows.push({ label: 'CPU (host RSS)', v: pl.host_mib, cap: (status.mem && status.mem.total_mib) || 0, c: '#5b6678' });
+  const gpuScale = Math.max(1, ...rows.filter(r => r.c === 'var(--acc)').map(r => Math.max(r.cap, r.v || 0)));
+  $('loadDevs').innerHTML = '<div class="note" style="margin-bottom:4px">placement from VRAM growth (this llama.cpp build prints no layer lines)' +
+    (pl.frozen ? ' · frozen at ready' : (st === 'starting' ? ' · live' : '')) + '</div>' +
+    rows.map(r => {
+      const sc = r.c === 'var(--acc)' ? gpuScale : Math.max(r.cap, r.v || 0, 1);
+      return `<div class="devrow"><span>${r.label}</span>${stackBar([{ v: r.v || 0, c: r.c, t: (r.v == null ? 'unknown' : gib(r.v) + ' GiB') }], sc)}<span>${gib(r.v)} GiB${r.cap ? ' / ' + gib(r.cap) : ''}</span></div>`;
+    }).join('') +
+    `<div class="legend"><span><i style="background:var(--acc)"></i>VRAM added since start</span><span><i style="background:#5b6678"></i>host RSS</span>` +
+    `<span style="margin-left:auto">${pl.gpu_share_pct != null ? pl.gpu_share_pct + '% on GPU · ' : ''}total ${gib(pl.total_mib)} GiB</span></div>` +
+    '<div class="note" style="margin-top:4px">other processes on the same GPUs inflate these numbers; RSS includes mmapped weights.</div>';
+  $('loadLayers').innerHTML = '';
   renderFit();
 }
 function renderFit() {
