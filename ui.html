@@ -97,6 +97,13 @@
   .cpugrid { display: grid; grid-template-columns: repeat(auto-fill, 20px); gap: 3px; }
   .cpugrid i { height: 20px; border-radius: 3px; background: var(--acc); border: 1px solid transparent; }
   .cpugrid i.pin { border-color: var(--warn); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 11.5px; padding: 2px 9px; border-radius: 10px; border: 1px solid var(--line); color: var(--dim); }
+  .chip.done { color: var(--text); background: #1a212b; } .chip.cur { color: var(--bg); background: var(--warn); border-color: var(--warn); } .chip.ok { color: var(--bg); background: var(--ok); border-color: var(--ok); }
+  .loadbar { height: 16px; } .loadbar i { background: var(--acc); transition: width .6s linear; }
+  .devrow { display: grid; grid-template-columns: 120px 1fr 170px; gap: 10px; align-items: center; font-size: 12.5px; padding: 3px 0; font-variant-numeric: tabular-nums; }
+  .layerstrip { display: flex; height: 18px; border-radius: 3px; overflow: hidden; border: 1px solid var(--line); background: #232a35; }
+  .layerstrip i { flex: 1 1 0; min-width: 2px; }
   @media (max-width: 860px) { .pane { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -140,6 +147,14 @@
       <div><b id="kRam">–</b><span>RAM used / total</span></div>
       <div><b id="kCpu">–</b><span>pinned cores (auto)</span></div>
     </div>
+  </section>
+
+  <section class="wide" id="loadPanel">
+    <h2>Model load <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="loadNote"></span></h2>
+    <div id="loadProg"></div>
+    <div id="loadDevs" style="margin-top:10px"></div>
+    <div id="loadLayers"></div>
+    <details id="loadFit" style="display:none"><summary>fit / memory-plan lines from the log</summary><pre id="loadFitText" style="margin-top:6px"></pre></details>
   </section>
 
   <section class="wide">
@@ -291,7 +306,7 @@
   </div>
   <div class="pane" id="pane-logs" data-tab="logs">
   <section class="wide">
-    <h2>llama-server log <span class="sp"></span><label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input id="follow" type="checkbox" checked> follow</label></h2>
+    <h2>llama-server log <span class="sp"></span><button onclick="dlStartupLog()" title="plain text of the log from the last 'starting profile' line">Download startup log</button>&nbsp;<label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input id="follow" type="checkbox" checked> follow</label></h2>
     <div id="logs"><pre id="logtext"></pre></div>
   </section>
 
@@ -607,7 +622,7 @@ async function refresh() {
   if (s.state === 'failed') { b.className = 'banner bad'; b.textContent = s.error; }
   else if (s.restart_needed) { b.className = 'banner warn'; b.innerHTML = 'The running server uses an older profile or a different one than the active profile. <a href="#" style="color:inherit" onclick="act(\'restart\');return false">Restart to apply</a>.'; }
   else b.className = 'banner';
-  renderGpus(); renderRam(); renderGen();
+  renderGpus(); renderRam(); renderGen(); renderLoad();
 }
 async function refreshLogs() {
   try {
@@ -742,6 +757,88 @@ function renderGen() {
   const s = status.server;
   $('kGen').textContent = s.state !== 'running' ? s.state : (s.inflight ? `generating ×${s.inflight}` : 'idle');
   $('kGen').className = s.inflight ? 's-running' : '';
+}
+
+
+/* ---- model load panel: status.server.load + GET /api/loadmap ---- */
+const LOAD_PHASES = ['starting', 'reading tensors', 'allocating/warming', 'ready'];
+const DEV_COL = ['#6aa8ff', '#4cc38a', '#e5b450', '#c58af9', '#ef8a6b', '#4ccbd6', '#d6d64c', '#f08fc0'];
+let loadMap = null, loadMapAt = 0, loadMapBusy = false, lastLoadSummary = null;
+const devCol = d => /^(cpu|host)|_(host|mapped)$/i.test(d) ? '#5b6678' : DEV_COL[(parseInt((d.match(/(\d+)$/) || [0, 0])[1], 10) || 0) % DEV_COL.length];
+function fmtGB(b) { return b == null ? '–' : (b / 2 ** 30).toFixed(b < 2 ** 33 ? 1 : 0) + ' GiB'; }
+function fmtEta(s) { if (s == null) return '–'; return s < 90 ? s + ' s' : Math.floor(s / 60) + ' min ' + (s % 60) + ' s'; }
+
+async function fetchLoadMap() {
+  if (loadMapBusy) return;
+  loadMapBusy = true;
+  loadMapAt = Date.now();
+  try { loadMap = await api('/api/loadmap'); } catch {} finally { loadMapBusy = false; renderLoad(); }
+}
+
+function renderLoad() {
+  if (!status || !$('loadProg')) return;
+  const s = status.server, L = s.load || {}, st = s.state;
+  if (st === 'running' && L.phase === 'ready') lastLoadSummary = { profile: s.profile, load_s: s.load_s, total: L.bytes_total };
+  // refresh the map while loading (every 3 s), once when something changed, and on first sight
+  const age = Date.now() - loadMapAt;
+  if ((st === 'starting' && age > 3000) || (!loadMap && age > 5000) || (st === 'running' && loadMap && loadMap.state !== 'running' && age > 1500)) fetchLoadMap();
+  let prog;
+  if (st === 'starting') {
+    const pct = L.pct != null ? L.pct : 0, cur = LOAD_PHASES.indexOf(L.phase);
+    const chips = LOAD_PHASES.map((p, i) => `<span class="chip ${i < cur ? 'done' : i === cur ? 'cur' : ''}">${p}</span>`).join('');
+    prog = `<div class="row" style="align-items:center;gap:14px;margin-bottom:8px"><b style="font-size:26px;font-variant-numeric:tabular-nums;min-width:64px">${L.pct != null ? pct + '%' : '–'}</b>
+      <div style="flex:1"><div class="bar loadbar"><i style="width:${pct}%"></i></div></div></div>
+      <div class="kv" style="margin-bottom:8px"><div><b>${fmtGB(L.bytes_read)} / ${fmtGB(L.bytes_total)}</b><span>read${L.source ? ' (' + esc(L.source) + ')' : ''}</span></div>
+      <div><b>${L.mbps != null ? L.mbps + ' MB/s' : '–'}</b><span>recent rate</span></div>
+      <div><b>${fmtEta(L.eta_s)}</b><span>ETA</span></div>
+      <div><b>${s.uptime_s != null ? fmtDur(s.uptime_s) : '–'}</b><span>elapsed</span></div></div><div class="chips">${chips}</div>`;
+    $('loadNote').textContent = (s.profile || '') + ' loading';
+  } else if (st === 'running') {
+    const sm = lastLoadSummary;
+    prog = `<div class="chips"><span class="chip ok">ready</span><span class="note" style="align-self:center">${esc(s.profile || '')} loaded${s.load_s != null ? ' in ' + fmtDur(s.load_s) : ''}${sm && sm.total ? ' · ' + fmtGB(sm.total) : ''}</span></div>`;
+    $('loadNote').textContent = 'loaded';
+  } else {
+    prog = `<div class="note">no model loading${st === 'failed' ? ' (last start failed, see the Logs tab)' : ''}.${lastLoadSummary ? ` Last load: ${esc(lastLoadSummary.profile || '')}${lastLoadSummary.load_s != null ? ' in ' + fmtDur(lastLoadSummary.load_s) : ''}.` : ''}</div>`;
+    $('loadNote').textContent = st;
+  }
+  $('loadProg').innerHTML = prog;
+  const m = loadMap, has = m && m.have_data && (m.devices.length || m.cpu_mib != null);
+  if (!has) { $('loadDevs').innerHTML = ''; $('loadLayers').innerHTML = ''; $('loadFit').style.display = (m && m.fit && m.fit.raw.length) ? '' : 'none'; renderFit(); return; }
+  const rows = m.devices.map(d => ({ name: d.name, label: d.gpu != null ? `GPU ${d.gpu} <span class="note">${esc(d.name)}</span>` : esc(d.name), w: d.weights_mib || 0, k: d.kv_mib || 0, c: d.compute_mib || 0,
+    cap: d.gpu != null ? ((status.gpus.find(g => g.index === d.gpu) || {}).mem_total || 0) : 0 }));
+  if (m.cpu_mib != null) rows.push({ name: 'CPU', label: 'CPU (host)', w: m.cpu.weights_mib || 0, k: m.cpu.kv_mib || 0, c: m.cpu.compute_mib || 0, cap: 0 });
+  const cpuScale = Math.max(1, ...rows.filter(r => r.name === 'CPU').map(r => r.w + r.k + r.c));
+  $('loadDevs').innerHTML = rows.map(r => {
+    const sc = r.name === 'CPU' ? cpuScale : Math.max(...rows.filter(x => x.name !== 'CPU').map(x => Math.max(x.cap, x.w + x.k + x.c)), 1);
+    const tot = r.w + r.k + r.c;
+    return `<div class="devrow"><span>${r.label}</span>${stackBar([{ v: r.w, c: 'var(--acc)', t: 'weights ' + gib(r.w) + ' GiB' }, { v: r.k, c: '#3d5f8f', t: 'KV ' + gib(r.k) + ' GiB' }, { v: r.c, c: '#8f9db3', t: 'compute ' + gib(r.c) + ' GiB' }], sc)}<span>${gib(tot)} GiB${r.cap ? ' / ' + gib(r.cap) : ''}</span></div>`;
+  }).join('') + '<div class="legend"><span><i style="background:var(--acc)"></i>weights</span><span><i style="background:#3d5f8f"></i>KV cache</span><span><i style="background:#8f9db3"></i>compute</span>' +
+    (m.layers_total != null ? `<span style="margin-left:auto">${m.layers_offloaded != null ? m.layers_offloaded + ' / ' : ''}${m.layers_total} layers on GPU</span>` : '') + '</div>';
+  if (m.per_layer && m.per_layer.length) {
+    const names = [...new Set(m.per_layer.map(x => x.device))];
+    $('loadLayers').innerHTML = '<div class="note" style="margin:10px 0 4px">layer → device</div><div class="layerstrip">' +
+      m.per_layer.map(x => `<i title="layer ${x.layer}: ${esc(x.device)}" style="background:${devCol(x.device)}"></i>`).join('') + '</div><div class="legend">' +
+      names.map(n => `<span><i style="background:${devCol(n)}"></i>${esc(n)}</span>`).join('') + '</div>';
+  } else $('loadLayers').innerHTML = '';
+  renderFit();
+}
+function renderFit() {
+  const raw = loadMap && loadMap.fit ? loadMap.fit.raw : [];
+  $('loadFit').style.display = raw.length ? '' : 'none';
+  $('loadFitText').textContent = raw.join('\n');
+}
+async function dlStartupLog() {
+  try {
+    const d = await api('/api/logs?n=3000');
+    let i = d.lines.length - 1;
+    while (i > 0 && !/\[ctl\] starting profile/.test(d.lines[i])) i--;
+    const txt = d.lines.slice(Math.max(0, i)).join('\n') + '\n';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
+    a.download = 'bizen-startup-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.log';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  } catch (e) { toast('could not fetch the log', true); }
 }
 
 /* ---- chat: streams /api/chat (SSE) ---- */
