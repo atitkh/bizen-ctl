@@ -1143,6 +1143,12 @@ class Sampler:
                 out.append(0)
         return ids, out
 
+    def _safe(self, name, *a):
+        try:
+            return getattr(self.sup, name)(*a)
+        except Exception:  # noqa: BLE001
+            return None
+
     def sample(self):
         pid = None
         try:
@@ -1156,7 +1162,7 @@ class Sampler:
                 "nodes": [n["used_mib"] for n in mem["nodes"]],
                 "gpus": [[g["index"], g["mem_used"], g["util"]] for g in gpu_info()],
                 "cpu": busy, "rss": mem["child"]["rss_mib"], "read_bytes": mem["child"]["read_bytes"],
-                "load": self.sup.load_info(mem["child"])}
+                "load": self._safe("load_info", mem["child"])}
 
     def _loop(self):
         while True:
