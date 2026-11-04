@@ -288,12 +288,92 @@ def pick_gpus(spec, own=(), exclude=()):
     return sorted(g["index"] for g in ranked[:n])
 
 
-def meminfo():
+def _kb_map(text):
+    """Parse '/proc/meminfo'-style lines ('Key:  123 kB') into {key: MiB}; tolerant of junk."""
     m = {}
-    for line in read("/proc/meminfo").splitlines():
+    for line in text.splitlines():
         k, _, v = line.partition(":")
-        m[k] = int(v.split()[0]) // 1024 if v.split() else 0
-    return {"total_mib": m.get("MemTotal"), "available_mib": m.get("MemAvailable")}
+        parts = v.split()
+        if parts:
+            try:
+                m[k.strip()] = int(parts[0]) // 1024
+            except ValueError:
+                pass
+    return m
+
+
+def numa_meminfo():
+    """Per-NUMA-node memory from sysfs (host-wide even inside LXD, unlike lxcfs's /proc/meminfo)."""
+    nodes = []
+    for path in sorted(glob.glob("/sys/devices/system/node/node[0-9]*/meminfo"),
+                       key=lambda p: int(re.search(r"node(\d+)", p).group(1))):
+        try:
+            idx = int(re.search(r"node(\d+)", path).group(1))
+            # lines look like 'Node 0 MemTotal:  131072 kB'
+            m = _kb_map(re.sub(r"^Node\s+\d+\s+", "", read(path), flags=re.M))
+            tot, free = m.get("MemTotal"), m.get("MemFree")
+            if tot is None or free is None:
+                continue
+            nodes.append({"node": idx, "total_mib": tot, "free_mib": free, "used_mib": tot - free,
+                          "cached_mib": m.get("FilePages", 0)})
+        except Exception:  # noqa: BLE001 - metrics must never raise
+            continue
+    return nodes
+
+
+def proc_stats(pid):
+    """RSS and cumulative read bytes of a process; each field None when unreadable."""
+    out = {"rss_mib": None, "read_bytes": None}
+    if not pid:
+        return out
+    try:
+        for line in read(f"/proc/{pid}/status").splitlines():
+            if line.startswith("VmRSS:"):
+                out["rss_mib"] = int(line.split()[1]) // 1024
+    except (ValueError, IndexError):
+        pass
+    try:
+        for line in read(f"/proc/{pid}/io").splitlines():
+            if line.startswith("read_bytes:"):
+                out["read_bytes"] = int(line.split()[1])
+    except (ValueError, IndexError):
+        pass
+    return out
+
+
+def cgroup_mem():
+    """Container cgroup usage/limit (cgroup v2, then v1); None when unavailable."""
+    for cur, lim in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+                     ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+        c = read(cur)
+        if c.isdigit():
+            l = read(lim)
+            limit = int(l) // 2**20 if l.isdigit() and int(l) < 2**60 else None
+            return {"used_mib": int(c) // 2**20, "limit_mib": limit}
+    return None
+
+
+def meminfo(pid=None):
+    """Memory snapshot. Never raises. total/available keep their old names; the rest is extra.
+    Note 'available' counts reclaimable page cache (an mmap'd model is cache), so it barely
+    moves when a model loads; 'used' (= total - available) and the NUMA node numbers do."""
+    try:
+        m = _kb_map(read("/proc/meminfo"))
+    except Exception:  # noqa: BLE001
+        m = {}
+    tot, avail = m.get("MemTotal"), m.get("MemAvailable")
+    out = {"total_mib": tot, "available_mib": avail,
+           "used_mib": tot - avail if tot is not None and avail is not None else None,
+           "free_mib": m.get("MemFree"), "buffers_mib": m.get("Buffers"), "cached_mib": m.get("Cached"),
+           "swap_total_mib": m.get("SwapTotal"),
+           "swap_used_mib": (m["SwapTotal"] - m["SwapFree"]) if "SwapTotal" in m and "SwapFree" in m else None,
+           "nodes": [], "cgroup": None, "child": proc_stats(pid), "ts": time.time()}
+    try:
+        out["nodes"] = numa_meminfo()
+        out["cgroup"] = cgroup_mem()
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 # ---------------------------------------------------------------- supervisor
@@ -312,6 +392,7 @@ class Supervisor:
         self.running_profile = None   # snapshot of the profile used to launch
         self.running_cmd = []
         self.running_gpus = []
+        self.running_cpus = []
         self.inflight = 0
         self.last_activity = time.time()
         self.logs = collections.deque(maxlen=3000)
@@ -397,6 +478,7 @@ class Supervisor:
             self.state, self.error = "starting", ""
             self.started_at, self.ready_at = time.time(), None
             self.running_profile, self.running_cmd, self.running_gpus = prof, cmd, gpus
+            self.running_cpus = cpus or []
             self.last_activity = time.time()
             self.ready_event.clear()
             proc = self.proc
@@ -845,6 +927,73 @@ class Router:
 
 # ---------------------------------------------------------------- http
 
+class Sampler:
+    """Background 1 s sampler feeding /api/metrics: RAM, per-NUMA used, GPUs, per-core CPU, child RSS."""
+
+    def __init__(self, sup, interval=1.0, keep=600):
+        self.sup, self.interval = sup, interval
+        self.samples = collections.deque(maxlen=keep)
+        self.lock = threading.Lock()
+        self._prev_cpu = None
+        self.cpu_ids = []
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _cpu_busy(self):
+        """Per-core busy % since the previous call, from /proc/stat deltas."""
+        cur = {}
+        for line in read("/proc/stat").splitlines():
+            m = re.match(r"cpu(\d+)\s+(.*)", line)
+            if not m:
+                continue
+            f = [int(x) for x in m.group(2).split()[:8]]
+            if len(f) >= 4:
+                cur[int(m.group(1))] = (sum(f), f[3] + (f[4] if len(f) > 4 else 0))  # total, idle+iowait
+        prev, self._prev_cpu = self._prev_cpu, cur
+        ids = sorted(cur)
+        self.cpu_ids = ids
+        if not prev:
+            return ids, [0] * len(ids)
+        out = []
+        for i in ids:
+            if i in prev and cur[i][0] > prev[i][0]:
+                dt, di = cur[i][0] - prev[i][0], cur[i][1] - prev[i][1]
+                out.append(max(0, min(100, round(100 * (dt - di) / dt))))
+            else:
+                out.append(0)
+        return ids, out
+
+    def sample(self):
+        pid = None
+        try:
+            pid = self.sup.proc.pid if self.sup.proc else None
+        except Exception:  # noqa: BLE001
+            pass
+        mem = meminfo(pid)
+        ids, busy = self._cpu_busy()
+        return {"t": round(time.time(), 2),
+                "ram_used": mem["used_mib"], "ram_cached": mem["cached_mib"], "ram_free": mem["free_mib"],
+                "nodes": [n["used_mib"] for n in mem["nodes"]],
+                "gpus": [[g["index"], g["mem_used"], g["util"]] for g in gpu_info()],
+                "cpu": busy, "rss": mem["child"]["rss_mib"], "read_bytes": mem["child"]["read_bytes"]}
+
+    def _loop(self):
+        while True:
+            t0 = time.time()
+            try:
+                s = self.sample()
+                with self.lock:
+                    self.samples.append(s)
+            except Exception as e:  # noqa: BLE001 - sampler must survive anything
+                log(f"sampler: {e}")
+            time.sleep(max(0.05, self.interval - (time.time() - t0)))
+
+    def since(self, ts):
+        with self.lock:
+            return [s for s in self.samples if s["t"] > ts]
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"   # close-delimited bodies keep streaming proxying simple
     server_version = "bizen-ctl"
@@ -966,7 +1115,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cpus, node = auto_pin()
             allowed, _, _ = cpu_topology()
             return self.send_json({
-                "server": sup.status(), "gpus": gpu_info(), "mem": meminfo(),
+                "server": sup.status(), "gpus": gpu_info(), "mem": meminfo(sup.proc.pid if sup.proc else None),
                 "cpus_allowed": allowed, "auto_pin": cpus, "auto_pin_node": node,
                 "active_profile": cfg.get("active_profile"),
                 "idle_ttl_min": cfg.get("idle_ttl_min"), "keep_loaded": cfg.get("keep_loaded"),
@@ -975,6 +1124,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "kev": self.server.kev.status(),
                 "router_enabled": self.server.router.enabled(),
             })
+        if path == "/api/metrics" and method == "GET":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                since = float((q.get("since") or ["0"])[0])
+            except ValueError:
+                since = 0.0
+            smp = self.server.sampler
+            pin = sup.running_cpus if sup.proc else auto_pin()[0]
+            return self.send_json({"now": time.time(), "interval_s": smp.interval, "cpu_ids": smp.cpu_ids,
+                                   "cpus_pinned": pin, "samples": smp.since(since)})
         if path == "/api/config" and method == "GET":
             return self.send_json(cfg.data)
         if path == "/api/config" and method == "PUT":
@@ -1207,6 +1366,8 @@ def main():
     router = Router(cfg, kev)
     srv = Server((cfg.get("listen_host"), cfg.get("listen_port")), Handler)
     srv.cfg, srv.sup, srv.kev, srv.router = cfg, sup, kev, router
+    srv.sampler = Sampler(sup)
+    srv.sampler.start()
 
     def shutdown(*_):
         log("shutting down")
