@@ -33,6 +33,13 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
 TPS_RE = re.compile(r"eval time\s*=.*?([\d.]+)\s*tokens per second")
 PROMPT_TPS_RE = re.compile(r"prompt eval time\s*=.*?([\d.]+)\s*tokens per second")
+# load phases, in order; each log line can only move the phase forward. Patterns are llama.cpp-style and optional.
+LOAD_PHASES = ["starting", "reading tensors", "allocating/warming", "ready"]
+PHASE_RES = [
+    (1, re.compile(r"load_model|llama_model_load|load_tensors|loading model tensors|llama_model_loader", re.I)),
+    (2, re.compile(r"offloaded\s+\d+\s*/\s*\d+\s+layers|llama_context|KV buffer size|compute buffer size|warming up|initializing slots", re.I)),
+    (3, re.compile(r"server is listening|ready after|all slots are idle", re.I)),
+]
 
 
 def log(msg):
@@ -323,7 +330,7 @@ def numa_meminfo():
 
 def proc_stats(pid):
     """RSS and cumulative read bytes of a process; each field None when unreadable."""
-    out = {"rss_mib": None, "read_bytes": None}
+    out = {"rss_mib": None, "read_bytes": None, "rchar": None}
     if not pid:
         return out
     try:
@@ -336,9 +343,36 @@ def proc_stats(pid):
         for line in read(f"/proc/{pid}/io").splitlines():
             if line.startswith("read_bytes:"):
                 out["read_bytes"] = int(line.split()[1])
+            elif line.startswith("rchar:"):
+                out["rchar"] = int(line.split()[1])   # bytes via read(): what --load-mode none does
     except (ValueError, IndexError):
         pass
     return out
+
+
+SHARD_RE = re.compile(r"^(.*)-(\d+)-of-(\d+)\.gguf$")
+
+
+def model_total_bytes(path):
+    """Total size of a model: all `-0000N-of-0000M.gguf` shards next to each other, or the single file.
+    None when nothing is readable. Never raises."""
+    try:
+        m = SHARD_RE.match(path)
+        if m:
+            w, n = len(m.group(2)), int(m.group(3))
+            files = [f"{m.group(1)}-{i:0{w}d}-of-{m.group(3)}.gguf" for i in range(1, n + 1)]
+        else:
+            files = [path]
+        tot, found = 0, 0
+        for f in files:
+            try:
+                tot += os.path.getsize(f)
+                found += 1
+            except OSError:
+                pass
+        return tot if found else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def cgroup_mem():
@@ -398,12 +432,83 @@ class Supervisor:
         self.logs = collections.deque(maxlen=3000)
         self.last_tps = None
         self.last_prompt_tps = None
+        self._load_reset(None)
         self.internal_key = secrets.token_urlsafe(24)
         self.ready_event = threading.Event()
         self.switch_lock = threading.Lock()   # serialises routed profile switches
         self.routed = False                   # the running profile was chosen by the router
         self.kev = None                       # set in main(): its GPUs are off limits to us
         threading.Thread(target=self._idle_loop, daemon=True).start()
+
+    # -- load progress
+    def _load_reset(self, model):
+        self.load_total = model_total_bytes(model) if model else None
+        self.load_phase = 0
+        self.load_bytes = 0
+        self.load_pct = 0
+        self.load_hist = collections.deque(maxlen=60)   # (t, bytes) for the recent MB/s
+
+    def _note_line(self, proc, line):
+        try:
+            hit = [i for i, rx in PHASE_RES if rx.search(line)]
+            if hit:
+                with self.lock:
+                    if self.proc is proc and self.state == "starting":
+                        self.load_phase = max(self.load_phase, min(max(hit), 2))   # ready comes from the health check
+        except Exception:  # noqa: BLE001
+            pass
+
+    def load_info(self, stats=None):
+        """Load progress for the child being started: phase, bytes_read/total, pct (monotonic, 99 max until
+        ready), mbps (recent) and eta_s. Unknown values are None. Never raises."""
+        out = {"phase": None, "bytes_read": None, "bytes_total": None, "pct": None,
+               "eta_s": None, "mbps": None, "source": None}
+        try:
+            with self.lock:
+                st, total = self.state, self.load_total
+                out["phase"] = st
+                out["bytes_total"] = total
+                if st == "running":
+                    out.update(phase="ready", pct=100, eta_s=0, bytes_read=total or self.load_bytes or None)
+                    return out
+                if st != "starting":
+                    return out
+                pid = self.proc.pid if self.proc else None
+                out["phase"] = LOAD_PHASES[self.load_phase]
+                stats = stats or proc_stats(pid)
+                rss = stats.get("rss_mib")
+                cand = {"rchar": stats.get("rchar"), "read_bytes": stats.get("read_bytes"),
+                        "rss": rss * 1048576 if rss is not None else None}
+                cand = {k: v for k, v in cand.items() if v is not None}
+                now = time.time()
+                if cand:
+                    src = max(cand, key=cand.get)
+                    b = cand[src]
+                    if total:
+                        b = min(b, total)
+                    if b >= self.load_bytes:
+                        self.load_bytes, out["source"] = b, src
+                    else:
+                        out["source"] = "held"
+                    if not self.load_hist or now - self.load_hist[-1][0] >= 0.5:
+                        self.load_hist.append((now, self.load_bytes))
+                out["bytes_read"] = self.load_bytes if cand else None
+                if total and cand:
+                    p = int(100 * self.load_bytes / total)
+                    if self.load_phase >= 2:
+                        p = max(p, 95)       # "offloaded N/M layers" is printed once the tensors are in
+                    self.load_pct = max(self.load_pct, min(p, 99))
+                    out["pct"] = self.load_pct
+                if len(self.load_hist) >= 2:
+                    old = next((h for h in self.load_hist if now - h[0] <= 10), self.load_hist[0])
+                    dt = self.load_hist[-1][0] - old[0]
+                    if dt >= 1:
+                        out["mbps"] = round(max(0, self.load_hist[-1][1] - old[1]) / dt / 1e6, 1)
+                if out["mbps"] and total and self.load_phase < 2 and self.load_bytes < total:
+                    out["eta_s"] = int((total - self.load_bytes) / (out["mbps"] * 1e6))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     # -- command building
     def build(self, prof):
@@ -479,6 +584,7 @@ class Supervisor:
             self.started_at, self.ready_at = time.time(), None
             self.running_profile, self.running_cmd, self.running_gpus = prof, cmd, gpus
             self.running_cpus = cpus or []
+            self._load_reset(prof["model"])
             self.last_activity = time.time()
             self.ready_event.clear()
             proc = self.proc
@@ -530,6 +636,7 @@ class Supervisor:
         for line in proc.stdout:
             line = line.rstrip()
             self.logs.append(line)
+            self._note_line(proc, line)
             m = PROMPT_TPS_RE.search(line)
             if m:
                 self.last_prompt_tps = float(m.group(1))
@@ -636,6 +743,7 @@ class Supervisor:
                 "unload_in_s": unload_in,
                 "last_tps": self.last_tps, "last_prompt_tps": self.last_prompt_tps,
                 "restart_needed": stale,
+                "load": self.load_info(),
             }
 
 
@@ -976,7 +1084,8 @@ class Sampler:
                 "ram_used": mem["used_mib"], "ram_cached": mem["cached_mib"], "ram_free": mem["free_mib"],
                 "nodes": [n["used_mib"] for n in mem["nodes"]],
                 "gpus": [[g["index"], g["mem_used"], g["util"]] for g in gpu_info()],
-                "cpu": busy, "rss": mem["child"]["rss_mib"], "read_bytes": mem["child"]["read_bytes"]}
+                "cpu": busy, "rss": mem["child"]["rss_mib"], "read_bytes": mem["child"]["read_bytes"],
+                "load": self.sup.load_info(mem["child"])}
 
     def _loop(self):
         while True:

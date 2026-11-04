@@ -19,8 +19,8 @@ check("child rss for own pid", isinstance(m["child"]["rss_mib"], int) and m["chi
 check("nodes shape", all({"node", "total_mib", "free_mib", "used_mib"} <= set(n) and n["used_mib"] == n["total_mib"] - n["free_mib"] for n in m["nodes"]))
 
 # a pid that does not exist, and None: every field None, no exception
-check("proc_stats(missing pid)", b.proc_stats(2**22 + 12345) == {"rss_mib": None, "read_bytes": None})
-check("proc_stats(None)", b.proc_stats(None) == {"rss_mib": None, "read_bytes": None})
+check("proc_stats(missing pid)", b.proc_stats(2**22 + 12345) == {"rss_mib": None, "read_bytes": None, "rchar": None})
+check("proc_stats(None)", b.proc_stats(None) == {"rss_mib": None, "read_bytes": None, "rchar": None})
 
 # every /proc and /sys read missing: meminfo still returns the full shape
 real = b.read
