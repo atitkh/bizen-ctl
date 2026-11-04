@@ -83,6 +83,63 @@ curl -s -H "Authorization: Bearer k1" $B/v1/route -d '{"prompt":"Fix this progra
 echo "--- kev empty model rejected (no command override)"
 curl -s -b "$T/jar" $B/api/config | j "d['kev']['model']='';d['kev']['command']='';print(json.dumps(d))" > "$T/kevbad.json"
 curl -s -b "$T/jar" -X PUT --data @"$T/kevbad.json" $B/api/config; echo
+FAILS=0
+ok() { if [ "$2" = "1" ]; then echo "PASS $1"; else echo "FAIL $1"; FAILS=$((FAILS+1)); fi; }
+echo "--- unit: meminfo / proc reads tolerate missing files, sampler ring buffer"
+python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
+grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
+grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
+ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
+echo "--- status.mem has the extended fields"
+curl -s -b "$T/jar" $B/api/status | j "m=d['mem'];print('mem ok' if all(k in m for k in ('total_mib','available_mib','used_mib','free_mib','buffers_mib','cached_mib','swap_used_mib','nodes','child')) and m['used_mib']==m['total_mib']-m['available_mib'] else 'mem MISSING: '+str(sorted(m)))" | tee "$T/o"
+ok "status.mem extended" $(grep -q "^mem ok" "$T/o" && echo 1 || echo 0)
+echo "--- /api/metrics: auth, shape, since filter"
+ok "metrics needs login" $([ "$(curl -s -o /dev/null -w %{http_code} $B/api/metrics)" = 401 ] && echo 1 || echo 0)
+sleep 3
+curl -s -b "$T/jar" "$B/api/metrics" > "$T/m1.json"
+python3 - "$T/m1.json" > "$T/o" <<'EOF2'
+import json,sys
+d=json.load(open(sys.argv[1])); s=d["samples"]
+need={"t","ram_used","nodes","gpus","cpu","rss"}
+print("shape", all(need<=set(x) for x in s) and bool(s) and "cpu_ids" in d and "cpus_pinned" in d and "now" in d)
+print("ordered", all(a["t"]<b["t"] for a,b in zip(s,s[1:])))
+print("cpu len", len(set(len(x["cpu"]) for x in s))==1 and len(s[-1]["cpu"])==len(d["cpu_ids"]))
+print("last", s[-1]["t"])
+EOF2
+cat "$T/o" | head -4
+ok "metrics shape" $(grep -q "^shape True" "$T/o" && echo 1 || echo 0)
+ok "metrics ordered" $(grep -q "^ordered True" "$T/o" && echo 1 || echo 0)
+ok "metrics per-core length matches cpu_ids" $(grep -q "^cpu len True" "$T/o" && echo 1 || echo 0)
+LAST=$(grep "^last" "$T/o" | cut -d' ' -f2)
+sleep 2.5
+curl -s -b "$T/jar" "$B/api/metrics?since=$LAST" | j "s=d['samples'];print('since',len(s)>=1 and all(x['t']>$LAST for x in s))" | tee "$T/o"
+ok "metrics since returns only newer samples" $(grep -q "since True" "$T/o" && echo 1 || echo 0)
+curl -s -b "$T/jar" "$B/api/metrics?since=9999999999" | j "print('empty',d['samples']==[])" | tee "$T/o"
+ok "metrics since=future is empty" $(grep -q "empty True" "$T/o" && echo 1 || echo 0)
+echo "--- /api/chat: auth, validation, streaming"
+ok "chat needs login" $([ "$(curl -s -o /dev/null -w %{http_code} -X POST -d '{"messages":[{"role":"user","content":"hi"}]}' $B/api/chat)" = 401 ] && echo 1 || echo 0)
+ok "chat rejects empty messages (400)" $([ "$(curl -s -b "$T/jar" -o /dev/null -w %{http_code} -X POST -d '{"messages":[]}' $B/api/chat)" = 400 ] && echo 1 || echo 0)
+curl -sN -b "$T/jar" -X POST -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"temperature":0.2}' $B/api/chat |
+  while IFS= read -r l; do case "$l" in *Hello*|*from*|*mock*|*DONE*) echo "$(date +%s.%N) $l";; esac; done > "$T/chat.out"
+python3 - "$T/chat.out" > "$T/o" <<'EOF2'
+import sys,json
+rows=[l.rstrip("\n").split(" ",1) for l in open(sys.argv[1]) if l.strip()]
+txt="".join(json.loads(r[1][5:])["choices"][0]["delta"]["content"] for r in rows if r[1].startswith("data: {"))
+print("text", repr(txt))
+print("done", any(r[1].strip()=="data: [DONE]" for r in rows))
+ts=[float(r[0]) for r in rows if r[1].startswith("data: {")]
+print("spread", round(ts[-1]-ts[0],2) if len(ts)>1 else -1)
+EOF2
+cat "$T/o" | head -3
+ok "chat streams the mock text" $(grep -q "^text 'Hello from mock'" "$T/o" && echo 1 || echo 0)
+ok "chat ends with [DONE]" $(grep -q "^done True" "$T/o" && echo 1 || echo 0)
+ok "chat chunks arrive incrementally (not buffered)" $(python3 -c "print(1 if float(open('$T/o').read().split('spread ')[1].split()[0])>=0.4 else 0)")
+curl -sN -b "$T/jar" -X POST -d '{"messages":[{"role":"user","content":"hi"}]}' $B/api/chat | head -c 4000 > "$T/chat.raw"
+ok "chat sends ready event before tokens" $(grep -q '"bizen": "ready"' "$T/chat.raw" && echo 1 || echo 0)
+echo "--- chat cold start shows loading events"
+curl -s -b "$T/jar" -X POST $B/api/stop >/dev/null; sleep 3
+curl -sN -b "$T/jar" -X POST -d '{"messages":[{"role":"user","content":"hi"}]}' $B/api/chat | head -c 4000 > "$T/chat.cold"
+ok "chat cold start: loading event then tokens" $(grep -q '"bizen": "loading"' "$T/chat.cold" && grep -q 'Hello' "$T/chat.cold" && echo 1 || echo 0)
 echo "--- models / UI"
 curl -s -b "$T/jar" $B/api/models; echo
 curl -s $B/ | grep -c "<title>bizen-ctl"
@@ -101,3 +158,5 @@ kill $CTL; sleep 2
 if kill -0 "$CHILD" 2>/dev/null; then echo "LEAKED CHILD $CHILD"; kill "$CHILD"; else echo "child $CHILD stopped"; fi
 if [ "$KCHILD" != "None" ] && kill -0 "$KCHILD" 2>/dev/null; then echo "LEAKED KEV $KCHILD"; kill "$KCHILD"; else echo "kev child stopped"; fi
 echo "--- controller log"; cat "$T/ctl.log"
+echo "--- result"; if [ "$FAILS" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; fi
+exit $([ "$FAILS" = 0 ] && echo 0 || echo 1)

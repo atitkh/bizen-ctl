@@ -73,6 +73,22 @@ Rules: the loaded profile is only replaced when no other request is in flight; a
 load (about a minute). If Kev is unsure (below the minimum probability) or unavailable, the default
 profile is used. Requests whose `model` is not the alias are never routed.
 
+## Admin page tabs
+
+The page at `/` is a tabbed dashboard; the selected tab is kept in the URL hash (`#chat`, `#profiles`, ...), so a reload stays put.
+
+- **Dashboard**: KPIs, per-GPU cards (memory bar plus a 5-minute util/memory sparkline; blue = this server's GPUs), a RAM panel (stacked used / cache / free bars for the container and for each NUMA node, 10-minute sparkline, llama-server RSS and bytes read from disk), a CPU grid (one cell per core, pinned cores outlined) and the generation state. Charts are inline SVG fed by `/api/metrics`.
+- **Chat**: streaming chat against the running profile (system prompt, max tokens, temperature, time-to-first-token and live tok/s, Stop, Clear). A cold model shows a "loading, first start can take minutes" banner.
+- **Profiles**: profile editor and Behaviour. **Kev**: router settings and router test. **Logs**: llama-server log. **Access**: API keys, admin password, endpoints.
+
+RAM note: "available" counts reclaimable page cache, and an mmap'd model *is* page cache, so it barely moves while a model loads or runs. The KPI therefore shows used (total - available) / total, and the RAM panel splits used from cache, per NUMA node (read from `/sys/devices/system/node`, which is host-wide even inside LXD, unlike lxcfs's `/proc/meminfo`).
+
+### New admin endpoints (cookie login, like the rest of `/api/*`)
+
+- `GET /api/metrics?since=<unix ts>`: samples newer than `since` from a 1 s background sampler (ring buffer, last 600). Each sample: `t`, `ram_used`, `ram_cached`, `ram_free`, `nodes` (used MiB per NUMA node), `gpus` (`[index, mem_used_mib, util]`), `cpu` (busy % per core, same order as the top-level `cpu_ids`), `rss` (llama-server RSS MiB), `read_bytes`. Also returns `now`, `interval_s`, `cpu_ids`, `cpus_pinned`.
+- `POST /api/chat` with `{messages, max_tokens?, temperature?}`: streams `text/event-stream`. Starts with `data: {"bizen":"loading"}` keepalives while the model loads, then `{"bizen":"ready"}`, then llama-server's own chat-completion chunks, then `[DONE]`. Errors arrive in-stream as `data: {"error": ...}`. Closing the connection stops generation.
+- `GET /api/status` keeps its shape; `mem` gained `used_mib`, `free_mib`, `buffers_mib`, `cached_mib`, `swap_*`, `nodes[]`, `cgroup` and `child` (`rss_mib`, `read_bytes`).
+
 ## Notes
 
 - llama-server itself listens only on 127.0.0.1 with a random internal key. All outside access goes through the controller.
