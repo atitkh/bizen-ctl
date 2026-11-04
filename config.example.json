@@ -1,0 +1,62 @@
+{
+  "listen_host": "0.0.0.0",
+  "listen_port": 8080,
+  "api_keys": [],
+  "admin_password": "",
+  "llama_server": "~/llama.cpp/build/bin/llama-server",
+  "model_dirs": ["/srv/fs/models"],
+  "internal_port": 18081,
+  "idle_ttl_min": 10,
+  "keep_loaded": false,
+  "start_timeout_s": 600,
+  "active_profile": "qwen36-2gpu",
+  "kev": {
+    "managed": true,
+    "dir": "~/kev",
+    "model": "jaredpalmer/kev-0.8b",
+    "port": 8009,
+    "dtype": "fp32",
+    "cuda_graphs": "auto",
+    "gpus": "auto:1",
+    "hf_home": "/srv/fs/hf",
+    "idle_ttl_min": 10
+  },
+  "router": {
+    "enabled": false,
+    "alias": "auto",
+    "default_profile": "qwen36-2gpu",
+    "threshold": 0.6,
+    "routes": [
+      {"profile": "qwen36-2gpu", "description": "Writing, fixing, reviewing or explaining code"},
+      {"profile": "qwen36-1gpu", "description": "General questions, chat and writing"}
+    ]
+  },
+  "profiles": [
+    {
+      "name": "qwen36-2gpu",
+      "model": "/srv/fs/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+      "gpus": "auto:2",
+      "ctx": 32768,
+      "threads": "auto",
+      "pin": "auto",
+      "fit": true,
+      "fit_target_mib": 2300,
+      "n_cpu_moe": null,
+      "kv_quant": "",
+      "extra_args": "-fa on --load-mode none"
+    },
+    {
+      "name": "qwen36-1gpu",
+      "model": "/srv/fs/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+      "gpus": "auto:1",
+      "ctx": 32768,
+      "threads": "auto",
+      "pin": "auto",
+      "fit": false,
+      "fit_target_mib": 2300,
+      "n_cpu_moe": 32,
+      "kv_quant": "",
+      "extra_args": "-fa on --load-mode none"
+    }
+  ]
+}

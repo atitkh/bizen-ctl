@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bizen-ctl</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --line: #252b35; --text: #d8dde6; --dim: #8691a3;
+    --acc: #6aa8ff; --ok: #4cc38a; --warn: #e5b450; --bad: #ef6b6b; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 14px 22px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .sp { flex: 1; }
+  main { max-width: 1180px; margin: 0 auto; padding: 18px 22px 60px; display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+  section.wide { grid-column: 1 / -1; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 12px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  h2 .sp { flex: 1; }
+  button { background: #222935; color: var(--text); border: 1px solid #2f3846; border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--acc); }
+  button.primary { background: var(--acc); border-color: var(--acc); color: #0b1220; font-weight: 600; }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .45; cursor: default; }
+  input, select, textarea { background: #0f1319; color: var(--text); border: 1px solid #2a313d; border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--acc); }
+  textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; background: #222935; }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .s-running { color: var(--ok); } .s-starting, .s-stopping { color: var(--warn); } .s-failed { color: var(--bad); } .s-stopped { color: var(--dim); }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .kv div { background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  .kv b { display: block; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .kv span { font-size: 11.5px; color: var(--dim); }
+  .gpu { display: grid; grid-template-columns: 54px 1fr 112px 46px; gap: 10px; align-items: center; padding: 4px 0; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .gpu.mine .idx { color: var(--acc); font-weight: 700; }
+  .bar { height: 8px; background: #0f1319; border-radius: 4px; overflow: hidden; border: 1px solid var(--line); }
+  .bar i { display: block; height: 100%; background: var(--dim); }
+  .gpu.mine .bar i { background: var(--acc); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px 14px; }
+  .full { grid-column: 1 / -1; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tab { padding: 5px 11px; border-radius: 6px; border: 1px solid #2f3846; cursor: pointer; font-size: 13px; background: #11151b; }
+  .tab.sel { border-color: var(--acc); color: var(--acc); }
+  .tab .star { color: var(--ok); margin-left: 4px; }
+  pre { margin: 0; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-all; }
+  #logs { height: 340px; overflow: auto; background: #0b0e12; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  .cmd { background: #0b0e12; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; color: #b8c4d6; }
+  .note { font-size: 12px; color: var(--dim); }
+  .banner { padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; display: none; }
+  .banner.warn { display: block; background: #2b2414; border: 1px solid #574617; color: var(--warn); }
+  .banner.bad { display: block; background: #2b1616; border: 1px solid #5a2323; color: var(--bad); }
+  .check { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; }
+  .check input { width: auto; }
+  #toast { position: fixed; bottom: 18px; right: 18px; background: #222935; border: 1px solid #2f3846; padding: 9px 14px; border-radius: 6px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  #toast.on { opacity: 1; } #toast.err { border-color: var(--bad); color: var(--bad); }
+  #login { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 5; }
+  #login form { width: 300px; display: grid; gap: 10px; }
+  .key { font-family: var(--mono); font-size: 12.5px; }
+  .rrow { display: grid; grid-template-columns: 200px 1fr 36px; gap: 8px; margin-bottom: 6px; }
+  .prob { display: grid; grid-template-columns: 170px 1fr 52px; gap: 8px; align-items: center; font-size: 13px; padding: 2px 0; font-variant-numeric: tabular-nums; }
+  .prob.top .nm { color: var(--acc); font-weight: 600; }
+  .prob.top .bar i { background: var(--acc); }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+<div id="login"><form onsubmit="login(event)">
+  <h1 style="font-size:16px;margin:0 0 6px">bizen-ctl</h1>
+  <input id="pw" type="password" placeholder="admin password" autofocus>
+  <button class="primary">Sign in</button>
+  <div id="loginErr" class="note" style="color:var(--bad)"></div>
+</form></div>
+
+<header>
+  <h1>bizen-ctl</h1>
+  <span id="state" class="pill s-stopped">stopped</span>
+  <span id="hdrProfile" class="note"></span>
+  <span class="sp"></span>
+  <button class="primary" id="btnStart" onclick="act('start')">Start</button>
+  <button id="btnRestart" onclick="act('restart')">Restart</button>
+  <button class="danger" id="btnStop" onclick="act('stop')">Stop</button>
+</header>
+
+<main>
+  <section class="wide">
+    <div id="banner" class="banner"></div>
+    <div class="kv">
+      <div><b id="kState">–</b><span>model</span></div>
+      <div><b id="kTps">–</b><span>last gen tok/s</span></div>
+      <div><b id="kPtps">–</b><span>last prompt tok/s</span></div>
+      <div><b id="kUp">–</b><span>uptime · load time</span></div>
+      <div><b id="kUnload">–</b><span>idle unload in</span></div>
+      <div><b id="kRam">–</b><span>RAM available</span></div>
+      <div><b id="kCpu">–</b><span>pinned cores (auto)</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>GPUs <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0">blue = ours</span></h2>
+    <div id="gpus"></div>
+  </section>
+
+  <section>
+    <h2>Behaviour</h2>
+    <div class="grid2">
+      <div><label>Unload after idle (minutes, 0 = never)</label><input id="ttl" type="number" min="0"></div>
+      <div style="display:flex;align-items:end"><label class="check"><input id="keep" type="checkbox"> Keep loaded (ignore idle unload)</label></div>
+      <div class="full"><label>Client endpoint</label>
+        <pre class="cmd" id="endpoint"></pre></div>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="primary" onclick="saveBehaviour()">Save</button>
+      <span class="note">Cold start after an unload takes about as long as the last load time.</span></div>
+  </section>
+
+  <section class="wide">
+    <h2>Profiles <span class="sp"></span>
+      <button onclick="newProfile()">New</button><button onclick="dupProfile()">Duplicate</button>
+      <button class="danger" onclick="delProfile()">Delete</button></h2>
+    <div class="tabs" id="tabs"></div>
+    <div class="grid3" id="pform">
+      <div><label>Name</label><input data-k="name"></div>
+      <div class="full" style="grid-column: span 2"><label>Model (.gguf)</label>
+        <input data-k="model" list="modelList"><datalist id="modelList"></datalist></div>
+      <div><label>GPUs: <code>auto:N</code> least-used, or <code>0,1</code></label><input data-k="gpus"></div>
+      <div><label>Context tokens</label><input data-k="ctx" type="number"></div>
+      <div><label>KV cache type</label><select data-k="kv_quant"><option value="">f16</option><option>q8_0</option><option>q4_0</option></select></div>
+      <div><label>Threads (<code>auto</code> = pinned core count)</label><input data-k="threads"></div>
+      <div><label>CPU pinning (<code>auto</code>, <code>off</code>, or list)</label><input data-k="pin"></div>
+      <div style="display:flex;align-items:end"><label class="check"><input data-k="fit" type="checkbox"> Auto-fit to VRAM (<code>--fit</code>)</label></div>
+      <div><label>Fit: free VRAM to leave per GPU (MiB)</label><input data-k="fit_target_mib" type="number"></div>
+      <div><label>No fit: <code>--n-cpu-moe</code> layers on CPU</label><input data-k="n_cpu_moe" type="number"></div>
+      <div class="full" style="grid-column: span 2"><label>llama-server binary (empty = global default)</label><input data-k="llama_server" class="key"></div>
+      <div class="full"><label>Extra llama-server args</label><input data-k="extra_args" class="key"></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="saveProfile(false)">Save</button>
+      <button onclick="saveProfile(true)">Save, make active &amp; restart</button>
+      <button onclick="preview()">Preview command</button>
+      <span class="note" id="pnote"></span>
+    </div>
+    <pre class="cmd" id="preview" style="margin-top:10px;display:none"></pre>
+  </section>
+
+  <section class="wide">
+    <h2>Router (Kev) <span class="sp"></span><span id="kevState" class="pill s-stopped">Kev stopped</span>
+      <button onclick="kevAct('start')">Start Kev</button><button class="danger" onclick="kevAct('stop')">Stop Kev</button></h2>
+    <div id="kevBanner" class="banner"></div>
+    <div id="kevRestart" class="banner warn">Kev is running <b id="kevRunModel"></b>, but the saved settings differ.
+      <a href="#" style="color:inherit" onclick="kevAct('restart');return false">Restart Kev to apply</a>.</div>
+    <label class="check" style="margin-bottom:12px"><input id="rtEnabled" type="checkbox">
+      Route requests that send <code id="rtAliasShow">model: auto</code> (Kev picks the profile, the controller switches to it when the box is idle)</label>
+    <div class="grid3">
+      <div><label>Alias clients send as <code>model</code></label><input id="rtAlias"></div>
+      <div><label>Default profile (Kev unsure or unavailable)</label><select id="rtDefault"></select></div>
+      <div><label>Minimum probability to trust Kev</label><input id="rtThreshold" type="number" step="0.05" min="0" max="1"></div>
+      <div style="grid-column: 1 / -1"><label>Question put to Kev</label><input id="rtInstr"></div>
+    </div>
+    <label style="margin-top:14px">Routes: one profile each, with a plain description of when it should be used</label>
+    <div id="rtRoutes"></div>
+    <div class="row"><button onclick="addRoute()">Add route</button>
+      <button class="primary" onclick="saveRouter()">Save router</button>
+      <button onclick="saveRouter(true)">Save &amp; restart Kev</button>
+      <span class="note">Kev answers from these descriptions, so wording matters. Save before testing.</span></div>
+    <details open>
+      <summary>Kev server settings (model, precision, GPU)</summary>
+      <div class="grid3" style="margin-top:10px">
+        <div style="grid-column: 1 / -1"><label>Kev model</label>
+          <select id="kevModelSel" onchange="kevPick()"></select>
+          <input data-kev="model" id="kevModelIn" oninput="kevHint()" placeholder="Hugging Face id or local run directory" style="margin-top:6px;display:none">
+          <div id="kevHint" class="note" style="margin-top:6px"></div></div>
+        <div><label>Precision</label><select data-kev="dtype" onchange="kevHint()"><option>fp32</option><option>fp16</option><option>bf16</option></select></div>
+        <div><label>CUDA graphs (off saves ~2 GB on 4B and up; slower per request)</label>
+          <select data-kev="cuda_graphs" onchange="kevHint()"><option value="auto">auto (Kev default: on)</option><option value="off">off</option><option value="on">on</option></select></div>
+        <div><label>Kev checkout</label><input data-kev="dir"></div>
+        <div><label>Port</label><input data-kev="port" type="number"></div>
+        <div><label>GPUs (<code>auto:1</code> or <code>5</code>)</label><input data-kev="gpus"></div>
+        <div><label>HF cache dir</label><input data-kev="hf_home"></div>
+        <div><label>Unload after idle (min, 0 = never)</label><input data-kev="idle_ttl_min" type="number"></div>
+        <div style="display:flex;align-items:end"><label class="check"><input data-kev="managed" type="checkbox"> Managed by bizen-ctl</label></div>
+        <div><label>External URL (when not managed)</label><input data-kev="url"></div>
+      </div>
+    </details>
+    <h2 style="margin-top:18px">Test the router</h2>
+    <textarea id="rtPrompt" rows="2">Fix this segfault in my C++ MQTT client</textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" id="btnRoute" onclick="routeTest(false)">Route only</button>
+      <button id="btnRouteRun" onclick="routeTest(true)">Route &amp; answer</button>
+      <span class="note" id="rtMeta"></span></div>
+    <div id="rtResult" style="margin-top:10px"></div>
+    <pre id="rtText" style="margin-top:8px;max-height:220px;overflow:auto"></pre>
+    <h2 style="margin-top:18px">Endpoints</h2>
+    <pre class="cmd" id="rtEndpoints"></pre>
+    <details id="kevLogBox"><summary>Kev log</summary>
+      <div id="kevLogs" style="height:200px;overflow:auto;background:#0b0e12;border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin-top:10px"><pre id="kevLogText"></pre></div>
+    </details>
+  </section>
+
+  <section>
+    <h2>Test prompt</h2>
+    <textarea id="prompt" rows="3">Explain mixture-of-experts models in three sentences.</textarea>
+    <div class="row" style="margin-top:8px"><button class="primary" id="btnTest" onclick="testPrompt()">Send</button><span class="note" id="testMeta"></span></div>
+    <pre id="testOut" style="margin-top:10px;max-height:260px;overflow:auto"></pre>
+  </section>
+
+  <section>
+    <h2>Access</h2>
+    <label>API keys (one per line; clients send <code>Authorization: Bearer &lt;key&gt;</code>)</label>
+    <textarea id="keys" rows="3" class="key"></textarea>
+    <div class="row" style="margin:8px 0 14px"><button onclick="addKey()">Generate key</button><button class="primary" onclick="saveKeys()">Save keys</button></div>
+    <label>Change admin password</label>
+    <div class="row"><input id="newpw" type="password" style="flex:1"><button onclick="savePw()">Change</button></div>
+    <div class="row" style="margin-top:14px"><button class="danger" onclick="ctlRestart()">Restart controller</button>
+      <span class="note">Needed only after changing the listen port. Service: <span id="unit">?</span></span></div>
+  </section>
+
+  <section class="wide">
+    <h2>llama-server log <span class="sp"></span><label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input id="follow" type="checkbox" checked> follow</label></h2>
+    <div id="logs"><pre id="logtext"></pre></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+let cfg = null, sel = null, status = null;
+const $ = id => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json' } });
+  if (r.status === 401) { $('login').style.display = 'flex'; throw new Error('login'); }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(typeof d.error === 'string' ? d.error : JSON.stringify(d.error || d));
+  return d;
+}
+function toast(msg, err) { const t = $('toast'); t.textContent = msg; t.className = 'on' + (err ? ' err' : ''); clearTimeout(t._h); t._h = setTimeout(() => t.className = '', 2600); }
+function fmtDur(s) { if (s == null) return '–'; if (s < 90) return s + 's'; if (s < 5400) return Math.round(s / 60) + 'm'; return (s / 3600).toFixed(1) + 'h'; }
+
+async function login(e) {
+  e.preventDefault();
+  try { await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: $('pw').value }) })
+    .then(r => { if (!r.ok) throw new Error('wrong password'); });
+    $('login').style.display = 'none'; init();
+  } catch (err) { $('loginErr').textContent = err.message; }
+}
+
+async function loadConfig() {
+  cfg = await api('/api/config');
+  if (!sel || !cfg.profiles.find(p => p.name === sel)) sel = cfg.active_profile;
+  $('ttl').value = cfg.idle_ttl_min; $('keep').checked = cfg.keep_loaded;
+  $('keys').value = cfg.api_keys.join('\n');
+  const host = location.hostname, port = location.port || 80;
+  $('endpoint').textContent = `base_url: ${location.protocol}//${host}:${port}/v1\napi_key:  ${cfg.api_keys[0] || '(none)'}\nmodel:    ${cfg.active_profile}`;
+  renderTabs(); fillForm(); loadRouter();
+}
+
+/* ---- router ---- */
+let rtRoutes = [];
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
+function loadRouter() {
+  const r = cfg.router, k = cfg.kev;
+  $('rtEnabled').checked = r.enabled; $('rtAlias').value = r.alias; $('rtThreshold').value = r.threshold;
+  $('rtInstr').value = r.instructions; $('rtAliasShow').textContent = 'model: ' + r.alias;
+  rtRoutes = structuredClone(r.routes);
+  $('rtDefault').innerHTML = cfg.profiles.map(p => `<option ${p.name === r.default_profile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+  document.querySelectorAll('[data-kev]').forEach(el => {
+    const v = k[el.dataset.kev];
+    if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? '';
+  });
+  renderRoutes();
+  syncKevSel();
+  const base = `${location.protocol}//${location.host}`, key = cfg.api_keys[0] || '<key>';
+  $('rtEndpoints').textContent =
+`# Kev picks the model, the controller switches to it, you get the answer
+curl ${base}/v1/chat/completions \\
+  -H "Authorization: Bearer ${key}" -H "Content-Type: application/json" \\
+  -d '{"model":"${r.alias}","messages":[{"role":"user","content":"your prompt"}]}'
+
+# Kev's decision only (nothing is loaded or switched)
+curl ${base}/v1/route \\
+  -H "Authorization: Bearer ${key}" -H "Content-Type: application/json" \\
+  -d '{"prompt":"your prompt"}'
+
+# Response headers on routed requests: X-Bizen-Route, X-Bizen-Route-P,
+# X-Bizen-Route-Fallback (why the default was used), X-Bizen-Route-Served (busy: kept the loaded one)`;
+}
+function renderRoutes() {
+  const names = cfg.profiles.map(p => p.name);
+  $('rtRoutes').innerHTML = rtRoutes.map((r, i) => `<div class="rrow">
+    <select onchange="rtRoutes[${i}].profile=this.value">${names.map(n => `<option ${n === r.profile ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+    <input value="${esc(r.description || '')}" placeholder="when should this model be used?" oninput="rtRoutes[${i}].description=this.value">
+    <button class="danger" onclick="rmRoute(${i})">✕</button></div>`).join('') || '<div class="note">No routes yet.</div>';
+}
+function addRoute() {
+  const used = new Set(rtRoutes.map(r => r.profile));
+  const free = cfg.profiles.map(p => p.name).find(n => !used.has(n)) || cfg.profiles[0].name;
+  rtRoutes.push({ profile: free, description: '' }); renderRoutes();
+}
+function rmRoute(i) { rtRoutes.splice(i, 1); renderRoutes(); }
+let kevPresets = [];
+async function loadKevPresets() {
+  try { kevPresets = (await api('/api/kev/presets')).presets; } catch { return; }
+  syncKevSel();
+}
+function syncKevSel() {
+  const sel = $('kevModelSel'), inp = $('kevModelIn');
+  sel.innerHTML = kevPresets.map(p => `<option value="${esc(p.id)}">${esc(p.id)}  ·  ${esc(p.base)}  ·  ${p.approx ? '≈' : ''}${p.weights_gib} GiB</option>`).join('')
+    + '<option value="__custom">Custom (type a Hugging Face id or run directory)…</option>';
+  const known = kevPresets.some(p => p.id === inp.value.trim());
+  sel.value = known ? inp.value.trim() : '__custom';
+  inp.style.display = known ? 'none' : 'block';
+  kevHint();
+}
+function kevPick() {
+  const v = $('kevModelSel').value, inp = $('kevModelIn');
+  if (v === '__custom') { inp.style.display = 'block'; inp.focus(); }
+  else {
+    inp.value = v; inp.style.display = 'none';
+    const p = kevPresets.find(x => x.id === v), g = document.querySelector('[data-kev="cuda_graphs"]');
+    if (p && p.weights_gib >= 4 && g.value === 'auto') g.value = 'off';      // big Kevs do not fit an 11 GB card with graph buffers
+  }
+  kevHint();
+}
+function kevHint() {
+  const el = $('kevHint'); if (!el) return;
+  const model = document.querySelector('[data-kev="model"]').value.trim();
+  const dtype = document.querySelector('[data-kev="dtype"]').value;
+  const p = kevPresets.find(x => x.id === model);
+  if (!p) { el.textContent = model ? 'Custom model: size unknown, so no fit check. It must load on a single GPU.' : ''; el.style.color = ''; return; }
+  const graphs = document.querySelector('[data-kev="cuda_graphs"]').value;
+  const w = p.weights_gib * (dtype === 'fp32' ? 2 : 1);
+  const bank = (graphs !== 'off' && p.weights_gib >= 4) ? 2.0 : 0;           // Kev's CUDA-graph state buffers, ~2 GB at 4B and 9B
+  const need = w + 1.5 + bank;                                               // weights + working set (+ graph buffers)
+  const cards = ((status && status.gpus) || []).map(g => g.mem_total).filter(Boolean);
+  const card = (cards.length ? Math.min(...cards) : 11264) / 1024;
+  const dl = p.weights_gib * 1.0, mins = Math.max(1, Math.round(dl * 1024 / 11.7 / 60));
+  const fits = need <= card - 0.5;
+  let t = `${p.base} · weights ≈ ${w.toFixed(1)} GiB in ${dtype}${p.approx ? ' (estimate)' : ''}, about ${need.toFixed(1)} GiB with working memory${bank ? ' and CUDA-graph buffers' : ''}, on a ${card.toFixed(0)} GiB card. `;
+  if (fits) t += 'Fits.';
+  else if (bank && w + 1.5 <= card - 0.5) t += 'Does NOT fit with CUDA graphs on: set CUDA graphs to off.';
+  else t += 'Will NOT fit on one GPU' + (dtype === 'fp32' && p.weights_gib <= card - 2 ? ': try fp16 (Turing has no bf16).' : '.');
+  if (dtype === 'fp16') t += ' fp16 has not been checked against fp32 here; compare a few answers.';
+  t += ` First start downloads the base model (≈ ${p.weights_gib} GiB, about ${mins} min at 11.7 MB/s); ${p.note}.`;
+  el.textContent = t; el.style.color = fits ? '' : 'var(--bad)';
+}
+async function saveRouter(restartKev) {
+  const c = structuredClone(cfg);
+  c.router = { ...cfg.router, enabled: $('rtEnabled').checked, alias: $('rtAlias').value.trim(),
+    default_profile: $('rtDefault').value, threshold: Number($('rtThreshold').value),
+    instructions: $('rtInstr').value.trim(), routes: rtRoutes.map(r => ({ profile: r.profile, description: (r.description || '').trim() })) };
+  c.kev = { ...cfg.kev };
+  document.querySelectorAll('[data-kev]').forEach(el => {
+    const k = el.dataset.kev;
+    c.kev[k] = el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value.trim();
+  });
+  try {
+    await putConfig(c, 'Router saved');
+    if (restartKev) await kevAct('restart');
+  } catch (e) { toast(e.message, true); }
+}
+async function kevAct(a) {
+  try { await api('/api/kev/' + a, { method: 'POST' }); toast('Kev ' + a + ' requested'); setTimeout(refresh, 400); }
+  catch (e) { toast(e.message, true); }
+}
+function renderDecision(dec) {
+  const probs = Object.entries(dec.probabilities || {}).sort((a, b) => b[1] - a[1]);
+  const bars = probs.map(([n, p], i) => `<div class="prob ${n === dec.choice ? 'top' : ''}"><span class="nm">${esc(n)}</span>
+    <div class="bar"><i style="width:${(p * 100).toFixed(1)}%"></i></div><span>${(p * 100).toFixed(0)}%</span></div>`).join('');
+  const note = dec.fallback ? `<div class="note" style="color:var(--warn)">Using default profile: ${esc(dec.fallback)}</div>` : '';
+  const sw = dec.serving && dec.serving !== dec.profile ? ` · loaded now: ${esc(dec.serving)} (switch needed)` : (dec.serving ? ' · already loaded' : '');
+  return `${bars}${note}<div class="note">→ <b>${esc(dec.profile)}</b>${sw}${dec.kev_ms != null ? ' · Kev ' + dec.kev_ms + ' ms' : ''}</div>`;
+}
+async function routeTest(run) {
+  $('btnRoute').disabled = $('btnRouteRun').disabled = true; $('rtText').textContent = ''; $('rtResult').innerHTML = '';
+  $('rtMeta').textContent = run ? 'routing and answering (a profile switch takes about a minute)…' : 'asking Kev (a cold start can take a minute)…';
+  try {
+    const d = await api('/api/route/test', { method: 'POST', body: JSON.stringify({ prompt: $('rtPrompt').value, run }) });
+    const dec = d.decision;
+    $('rtResult').innerHTML = renderDecision(dec);
+    if (run) {
+      $('rtText').textContent = (d.reasoning ? '[thinking]\n' + d.reasoning.trim() + '\n\n' : '') + d.text;
+      $('rtMeta').textContent = `${d.tokens ?? '?'} tokens · ${d.tps ? d.tps.toFixed(1) : '?'} tok/s · ${d.wall_s}s · served by ${d.profile}`;
+    } else $('rtMeta').textContent = '';
+  } catch (e) { $('rtMeta').textContent = ''; toast(e.message, true); }
+  $('btnRoute').disabled = $('btnRouteRun').disabled = false;
+}
+
+function renderTabs() {
+  $('tabs').innerHTML = cfg.profiles.map(p =>
+    `<span class="tab ${p.name === sel ? 'sel' : ''}" onclick="selectProfile('${p.name}')">${p.name}${p.name === cfg.active_profile ? '<span class="star">● active</span>' : ''}</span>`).join('');
+}
+function selectProfile(n) { sel = n; renderTabs(); fillForm(); $('preview').style.display = 'none'; }
+function curProfile() { return cfg.profiles.find(p => p.name === sel); }
+function fillForm() {
+  const p = curProfile(); if (!p) return;
+  document.querySelectorAll('#pform [data-k]').forEach(el => {
+    const v = p[el.dataset.k];
+    if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? '';
+  });
+}
+function readForm() {
+  const p = { ...curProfile() };
+  document.querySelectorAll('#pform [data-k]').forEach(el => {
+    const k = el.dataset.k;
+    if (el.type === 'checkbox') p[k] = el.checked;
+    else if (el.type === 'number') p[k] = el.value === '' ? null : Number(el.value);
+    else p[k] = el.value.trim();
+  });
+  if (/^\d+$/.test(p.threads)) p.threads = Number(p.threads);
+  return p;
+}
+async function putConfig(c, msg) {
+  await api('/api/config', { method: 'PUT', body: JSON.stringify(c) });
+  toast(msg || 'Saved'); await loadConfig(); refresh();
+}
+async function saveProfile(activate) {
+  const p = readForm(), old = sel;
+  const c = structuredClone(cfg);
+  c.profiles = c.profiles.map(x => x.name === old ? p : x);
+  if (c.active_profile === old || activate) c.active_profile = p.name;
+  try {
+    sel = p.name; await putConfig(c, activate ? 'Saved, restarting…' : 'Profile saved');
+    if (activate) await act('restart');
+  } catch (e) { sel = old; toast(e.message, true); }
+}
+function uniqueName(base) { let n = base, i = 2; while (cfg.profiles.find(p => p.name === n)) n = `${base}-${i++}`; return n; }
+async function newProfile() {
+  const c = structuredClone(cfg), name = uniqueName('new');
+  c.profiles.push({ name, model: (cfg.profiles[0] || {}).model || '' });
+  try { sel = name; await putConfig(c, 'Profile created'); } catch (e) { toast(e.message, true); }
+}
+async function dupProfile() {
+  const c = structuredClone(cfg), name = uniqueName(sel + '-copy');
+  c.profiles.push({ ...readForm(), name });
+  try { sel = name; await putConfig(c, 'Duplicated'); } catch (e) { toast(e.message, true); }
+}
+async function delProfile() {
+  if (sel === cfg.active_profile) return toast('Make another profile active first', true);
+  if (!confirm(`Delete profile ${sel}?`)) return;
+  const c = structuredClone(cfg); c.profiles = c.profiles.filter(p => p.name !== sel);
+  try { sel = null; await putConfig(c, 'Deleted'); } catch (e) { toast(e.message, true); }
+}
+async function preview() {
+  try { const d = await api('/api/preview', { method: 'POST', body: JSON.stringify(readForm()) });
+    $('preview').style.display = 'block'; $('preview').textContent = d.cmd;
+  } catch (e) { toast(e.message, true); }
+}
+async function saveBehaviour() {
+  const c = structuredClone(cfg); c.idle_ttl_min = Number($('ttl').value) || 0; c.keep_loaded = $('keep').checked;
+  try { await putConfig(c); } catch (e) { toast(e.message, true); }
+}
+function addKey() {
+  const a = new Uint8Array(24); crypto.getRandomValues(a);
+  const k = 'bz-' + Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+  $('keys').value = ($('keys').value.trim() + '\n' + k).trim();
+}
+async function saveKeys() {
+  const c = structuredClone(cfg); c.api_keys = $('keys').value.split('\n').map(s => s.trim()).filter(Boolean);
+  try { await putConfig(c, 'Keys saved'); } catch (e) { toast(e.message, true); }
+}
+async function savePw() {
+  const v = $('newpw').value; if (v.length < 8) return toast('Use at least 8 characters', true);
+  const c = structuredClone(cfg); c.admin_password = v;
+  try { await putConfig(c, 'Password changed'); $('newpw').value = ''; } catch (e) { toast(e.message, true); }
+}
+async function ctlRestart() {
+  if (!confirm('Restart the controller? The model will be unloaded.')) return;
+  await api('/api/controller/restart', { method: 'POST' }).catch(() => {});
+  toast('Controller restarting…');
+}
+async function act(a) {
+  try { await api('/api/' + a, { method: 'POST' }); toast(a[0].toUpperCase() + a.slice(1) + ' requested'); setTimeout(refresh, 400); }
+  catch (e) { toast(e.message, true); }
+}
+async function testPrompt() {
+  $('btnTest').disabled = true; $('testOut').textContent = ''; $('testMeta').textContent = 'waiting (cold start can take a minute)…';
+  try {
+    const d = await api('/api/test', { method: 'POST', body: JSON.stringify({ prompt: $('prompt').value }) });
+    $('testOut').textContent = (d.reasoning ? '[thinking]\n' + d.reasoning.trim() + '\n\n' : '') + d.text;
+    $('testMeta').textContent = `${d.tokens ?? '?'} tokens · ${d.tps ? d.tps.toFixed(1) : '?'} tok/s · prompt ${d.prompt_tps ? d.prompt_tps.toFixed(0) : '?'} tok/s · ${d.wall_s}s`;
+  } catch (e) { $('testMeta').textContent = ''; toast(e.message, true); }
+  $('btnTest').disabled = false;
+}
+
+async function refresh() {
+  try { status = await api('/api/status'); } catch { return; }
+  const s = status.server;
+  $('state').className = 'pill s-' + s.state; $('state').textContent = s.state;
+  $('hdrProfile').textContent = s.profile ? `${s.profile}${s.gpus.length ? ' · GPU ' + s.gpus.join(',') : ''}` : `active: ${status.active_profile}`;
+  const live = ['starting', 'running'].includes(s.state);
+  $('btnStart').disabled = live || s.state === 'stopping'; $('btnStop').disabled = !live;
+  $('kState').textContent = s.state; $('kState').className = 's-' + s.state;
+  $('kTps').textContent = s.last_tps ? s.last_tps.toFixed(1) : '–';
+  $('kPtps').textContent = s.last_prompt_tps ? s.last_prompt_tps.toFixed(0) : '–';
+  $('kUp').textContent = s.uptime_s != null ? `${fmtDur(s.uptime_s)} · ${fmtDur(s.load_s)}` : '–';
+  $('kUnload').textContent = status.keep_loaded ? 'never' : (s.unload_in_s != null ? fmtDur(s.unload_in_s) : (s.inflight ? 'busy' : '–'));
+  $('kRam').textContent = status.mem.available_mib ? (status.mem.available_mib / 1024).toFixed(0) + ' GiB' : '–';
+  $('kCpu').textContent = status.auto_pin.length + (status.auto_pin_node != null ? ` (node ${status.auto_pin_node})` : '');
+  $('kCpu').title = 'auto: ' + status.auto_pin.join(',') + '\nallowed: ' + status.cpus_allowed.join(',') + (status.numactl ? '' : '\nnumactl missing: using taskset, no memory binding');
+  $('unit').textContent = status.unit || 'not under systemd';
+  const kv = status.kev;
+  $('kevState').className = 'pill s-' + (kv.state === 'external' ? 'running' : kv.state);
+  $('kevState').textContent = 'Kev ' + kv.state + (kv.gpus.length ? ' · GPU ' + kv.gpus.join(',') : '') +
+    (kv.last_ms != null ? ' · last ' + kv.last_ms + ' ms' : '') + (kv.unload_in_s != null ? ' · unloads in ' + fmtDur(kv.unload_in_s) : '');
+  const kb = $('kevBanner');
+  if (kv.state === 'failed') { kb.className = 'banner bad'; kb.textContent = kv.error; } else kb.className = 'banner';
+  $('kevRestart').className = 'banner' + (kv.restart_needed ? ' warn' : '');
+  $('kevRunModel').textContent = kv.running_model || '';
+  kevHint();
+  const b = $('banner');
+  if (s.state === 'failed') { b.className = 'banner bad'; b.textContent = s.error; }
+  else if (s.restart_needed) { b.className = 'banner warn'; b.innerHTML = 'The running server uses an older profile or a different one than the active profile. <a href="#" style="color:inherit" onclick="act(\'restart\');return false">Restart to apply</a>.'; }
+  else b.className = 'banner';
+  $('gpus').innerHTML = status.gpus.length ? status.gpus.map(g => {
+    const mine = s.gpus.includes(g.index) && live, pct = g.mem_total ? 100 * g.mem_used / g.mem_total : 0;
+    return `<div class="gpu ${mine ? 'mine' : ''}"><span class="idx">GPU ${g.index}</span><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>
+      <span>${(g.mem_used / 1024).toFixed(1)} / ${(g.mem_total / 1024).toFixed(0)} GiB</span><span>${g.util ?? '?'}%</span></div>`;
+  }).join('') : '<div class="note">nvidia-smi not available</div>';
+}
+async function refreshLogs() {
+  try {
+    const d = await api('/api/logs?n=500'), box = $('logs');
+    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    $('logtext').textContent = d.lines.join('\n');
+    if ($('follow').checked && atBottom) box.scrollTop = box.scrollHeight;
+    if ($('kevLogBox').open) {
+      const k = await api('/api/kev/logs'), kb = $('kevLogs');
+      $('kevLogText').textContent = k.lines.join('\n'); kb.scrollTop = kb.scrollHeight;
+    }
+  } catch {}
+}
+async function loadModels() {
+  try { const d = await api('/api/models');
+    $('modelList').innerHTML = d.models.map(m => `<option value="${m.path}">${m.gib} GiB</option>`).join('');
+  } catch {}
+}
+async function init() {
+  try { await loadConfig(); } catch { return; }
+  loadModels(); loadKevPresets(); refresh(); refreshLogs();
+  $('logs').scrollTop = 1e9;
+  if (!window._timers) window._timers = [setInterval(refresh, 2000), setInterval(refreshLogs, 2000)];
+}
+init();
+</script>
+</body>
+</html>

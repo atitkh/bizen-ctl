@@ -1,0 +1,80 @@
+# bizen-ctl
+
+One-port controller for llama-server on the shared Bizon box. Python stdlib only.
+
+- `http://host:8080/v1/...`: OpenAI-compatible API, needs `Authorization: Bearer <key>`.
+  The first request loads the active profile (about 1 min from the NAS). After `idle_ttl_min`
+  with no requests it unloads and frees the GPUs.
+- `http://host:8080/`: web UI (admin password). Edit and switch profiles, start/stop/restart,
+  per-GPU VRAM, live log, tok/s, test prompt, API keys.
+
+## Install (on bizon, as your user)
+
+```
+tar xzf bizen-ctl.tgz -C ~ && cd ~/bizen-ctl
+# stop the llama-server you started by hand first (it holds port 8080)
+./install.sh
+```
+
+The installer writes `config.json` with a new API key and admin password and prints both once.
+It also installs and starts the `systemd --user` service `bizen-ctl` and tries to enable
+lingering so the service survives logout.
+
+## Day to day
+
+- Everything is in the UI. "Save, make active & restart" applies a profile.
+- `systemctl --user status|restart|stop bizen-ctl`
+- `journalctl --user -u bizen-ctl -f` shows controller logs. The llama-server log is in the UI.
+
+## Profile fields
+
+| field | meaning |
+|---|---|
+| gpus | `auto:N` picks the N GPUs with the least VRAM in use at start (ties go to the highest index, away from other users' default GPU 0), or a fixed list like `6,7` |
+| fit / fit_target_mib | let `--fit` size the GPU/CPU split, leaving this much VRAM free per GPU |
+| n_cpu_moe | used only when fit is off |
+| pin / threads | `auto` = one thread per physical core on the socket where the container owns the most cores, with memory bound to it (numactl). This is recomputed at every start, so it survives LXD reshuffling the cpuset. |
+| extra_args | appended as-is (`-fa on --load-mode none` by default) |
+
+## Router (Kev)
+
+Kev (a small decision model) picks which profile should answer a prompt.
+
+1. Install Kev once in `~/kev` (`uv sync --extra serve`) and stop any Kev you started by hand (port 8009).
+2. In the UI, Router section: add one route per profile with a plain description of when to use it,
+   choose a default profile, tick the enable box, Save. bizen-ctl starts Kev itself on first use
+   (on a GPU that llama-server isn't using) and unloads it after its own idle timer.
+3. Use it:
+   - `POST /v1/chat/completions` with `"model": "auto"` (the alias is configurable). Kev picks the
+     profile, the controller switches to it, and you get the answer.
+   - `POST /v1/route` with `{"prompt": "..."}` returns Kev's decision only. Nothing is loaded.
+   - `GET /v1/models` lists the profiles and the alias.
+4. Response headers on routed requests: `X-Bizen-Route` (profile), `X-Bizen-Route-P` (probability),
+   `X-Bizen-Route-Fallback` (why the default was used), `X-Bizen-Route-Served` (a different profile was
+   kept because other requests were in flight).
+
+### Changing Kev's model
+
+Router section, "Kev server settings": the Kev model field is a picker (published checkpoints with size
+hints) that also takes any Hugging Face id or local run directory. Pick the precision next to it; the line
+below the field says whether weights plus working memory fit on one card. Kev loads on a single GPU only.
+
+- "Save & restart Kev" applies it at once. A plain Save only flags "restart needed"; the running Kev keeps
+  its old model until it restarts or unloads on idle.
+- The first start of a new model downloads its base weights (kev-4b: about 8 GB, roughly 12 minutes at your
+  11.7 MB/s). The Kev start timeout is 900 s; raise `kev.start_timeout_s` for a bigger download.
+- CUDA graphs: Kev replays its passes as CUDA graphs by default, which needs a state buffer of about 2 GB
+  on kev-4b and kev-9b. On an 11 GB card kev-4b (8.4 GiB fp16 weights) only fits with "CUDA graphs: off"
+  (`KEV_CUDA_GRAPHS=0`); the picker sets that for you. Requests are slower with graphs off.
+- Turing (2080 Ti) has no bf16, so use fp32, or fp16 for models that need it (kev-4b). fp16 was not
+  compared with fp32 here, so check a few answers.
+
+Rules: the loaded profile is only replaced when no other request is in flight; a switch costs a model
+load (about a minute). If Kev is unsure (below the minimum probability) or unavailable, the default
+profile is used. Requests whose `model` is not the alias are never routed.
+
+## Notes
+
+- llama-server itself listens only on 127.0.0.1 with a random internal key. All outside access goes through the controller.
+- `config.json` holds secrets (mode 600). Each save keeps the previous version as `config.json.bak`.
+- Tests: `test/run-tests.sh` runs the controller against a mock llama-server.
