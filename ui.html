@@ -74,6 +74,22 @@
   .prob.top .bar i { background: var(--acc); }
   details { margin-top: 12px; }
   summary { cursor: pointer; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  .gpugrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+  .gcard { background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-variant-numeric: tabular-nums; }
+  .gcard.mine { border-color: #35568a; }
+  .gcard .hd { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 6px; }
+  .gcard.mine .idx { color: var(--acc); font-weight: 700; }
+  .gcard .ft { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--dim); margin-top: 4px; }
+  .gcard.mine .bar i { background: var(--acc); }
+  svg.spark { display: block; width: 100%; background: #0d1015; border-radius: 4px; }
+  .sbar { display: flex; height: 14px; background: #232a35; border-radius: 4px; overflow: hidden; border: 1px solid var(--line); }
+  .sbar i { display: block; height: 100%; }
+  .nodebar { display: grid; grid-template-columns: 64px 1fr 150px; gap: 10px; align-items: center; font-size: 12.5px; padding: 3px 0; font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--dim); margin-top: 6px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .cpugrid { display: grid; grid-template-columns: repeat(auto-fill, 20px); gap: 3px; }
+  .cpugrid i { height: 20px; border-radius: 3px; background: var(--acc); border: 1px solid transparent; }
+  .cpugrid i.pin { border-color: var(--warn); }
   @media (max-width: 860px) { .pane { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -113,14 +129,30 @@
       <div><b id="kPtps">–</b><span>last prompt tok/s</span></div>
       <div><b id="kUp">–</b><span>uptime · load time</span></div>
       <div><b id="kUnload">–</b><span>idle unload in</span></div>
-      <div><b id="kRam">–</b><span>RAM available</span></div>
+      <div><b id="kGen">–</b><span>generation</span></div>
+      <div><b id="kRam">–</b><span>RAM used / total</span></div>
       <div><b id="kCpu">–</b><span>pinned cores (auto)</span></div>
     </div>
   </section>
 
+  <section class="wide">
+    <h2>GPUs <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0">blue = ours &middot; line = util, shaded = memory &middot; last 5 min</span></h2>
+    <div id="gpus" class="gpugrid"></div>
+  </section>
+
   <section>
-    <h2>GPUs <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0">blue = ours</span></h2>
-    <div id="gpus"></div>
+    <h2>RAM <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="ramNote"></span></h2>
+    <div id="ramBars"></div>
+    <div class="legend"><span><i style="background:var(--acc)"></i>used</span><span><i style="background:#3d5f8f"></i>cache</span><span><i style="background:#232a35"></i>free</span></div>
+    <div class="note" style="margin:10px 0 2px">RAM used, last 10 min <span id="ramSparkNote"></span></div>
+    <div id="ramSpark"></div>
+    <div class="kv" style="margin-top:10px" id="ramKv"></div>
+  </section>
+
+  <section>
+    <h2>CPU <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="cpuNote"></span></h2>
+    <div id="cpuGrid" class="cpugrid"></div>
+    <div class="note" style="margin-top:8px">One cell per core, brighter = busier. Outlined = pinned for the running profile.</div>
   </section>
 
   <section>
@@ -262,6 +294,8 @@
 
 <script>
 let cfg = null, sel = null, status = null;
+let curTab = 'dashboard';
+const tabHooks = {};   // tab name -> {show(), hide()}
 const $ = id => document.getElementById(id);
 
 async function api(path, opts = {}) {
@@ -532,7 +566,6 @@ async function refresh() {
   $('kPtps').textContent = s.last_prompt_tps ? s.last_prompt_tps.toFixed(0) : '–';
   $('kUp').textContent = s.uptime_s != null ? `${fmtDur(s.uptime_s)} · ${fmtDur(s.load_s)}` : '–';
   $('kUnload').textContent = status.keep_loaded ? 'never' : (s.unload_in_s != null ? fmtDur(s.unload_in_s) : (s.inflight ? 'busy' : '–'));
-  $('kRam').textContent = status.mem.available_mib ? (status.mem.available_mib / 1024).toFixed(0) + ' GiB' : '–';
   $('kCpu').textContent = status.auto_pin.length + (status.auto_pin_node != null ? ` (node ${status.auto_pin_node})` : '');
   $('kCpu').title = 'auto: ' + status.auto_pin.join(',') + '\nallowed: ' + status.cpus_allowed.join(',') + (status.numactl ? '' : '\nnumactl missing: using taskset, no memory binding');
   $('unit').textContent = status.unit || 'not under systemd';
@@ -549,11 +582,7 @@ async function refresh() {
   if (s.state === 'failed') { b.className = 'banner bad'; b.textContent = s.error; }
   else if (s.restart_needed) { b.className = 'banner warn'; b.innerHTML = 'The running server uses an older profile or a different one than the active profile. <a href="#" style="color:inherit" onclick="act(\'restart\');return false">Restart to apply</a>.'; }
   else b.className = 'banner';
-  $('gpus').innerHTML = status.gpus.length ? status.gpus.map(g => {
-    const mine = s.gpus.includes(g.index) && live, pct = g.mem_total ? 100 * g.mem_used / g.mem_total : 0;
-    return `<div class="gpu ${mine ? 'mine' : ''}"><span class="idx">GPU ${g.index}</span><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>
-      <span>${(g.mem_used / 1024).toFixed(1)} / ${(g.mem_total / 1024).toFixed(0)} GiB</span><span>${g.util ?? '?'}%</span></div>`;
-  }).join('') : '<div class="note">nvidia-smi not available</div>';
+  renderGpus(); renderRam(); renderGen();
 }
 async function refreshLogs() {
   try {
@@ -580,10 +609,118 @@ async function init() {
     setInterval(() => { if (!document.hidden && (curTab === 'logs' || curTab === 'kev')) refreshLogs(); }, 2000)];
 }
 
+
+/* ---- dashboard: live metrics from /api/metrics, drawn as inline SVG ---- */
+let mbuf = [], mT = 0, mMeta = { cpu_ids: [], cpus_pinned: [] }, mBusy = false;
+const gib = m => m == null ? '–' : (m / 1024).toFixed(m < 10240 ? 1 : 0);
+function pctOf(a, b) { return b ? Math.max(0, Math.min(100, 100 * a / b)) : 0; }
+
+async function pollMetrics() {
+  if (mBusy || document.hidden || curTab !== 'dashboard') return;
+  mBusy = true;
+  try {
+    const d = await api('/api/metrics?since=' + mT);
+    mMeta = d;
+    for (const x of d.samples) if (x.t > mT) { mbuf.push(x); mT = x.t; }
+    const cut = (d.now || Date.now() / 1000) - 620;
+    while (mbuf.length && mbuf[0].t < cut) mbuf.shift();
+    renderGpus(); renderRam(); renderCpu();
+  } catch {} finally { mBusy = false; }
+}
+tabHooks.dashboard = { show() { pollMetrics(); } };
+setInterval(pollMetrics, 1000);
+
+/* generic sparkline: series = [{v: fn(sample) -> number|null, color, fill}], x spans `win` seconds ending at the newest sample */
+function spark(samples, series, win, ymax, h) {
+  const W = 300, H = h || 44, now = samples.length ? samples[samples.length - 1].t : 0, t0 = now - win;
+  let out = `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">`;
+  out += `<line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="#1c222c" stroke-width="1"/>`;
+  for (const sr of series) {
+    let pts = [];
+    for (const x of samples) {
+      const v = sr.v(x); if (v == null) continue;
+      pts.push([((x.t - t0) / win * W).toFixed(1), (H - 1 - Math.min(1, v / ymax) * (H - 3)).toFixed(1)]);
+    }
+    if (pts.length < 2) continue;
+    const line = pts.map(p => p.join(',')).join(' ');
+    if (sr.fill) out += `<polygon points="${pts[0][0]},${H} ${line} ${pts[pts.length - 1][0]},${H}" fill="${sr.color}" fill-opacity=".22"/>`;
+    else out += `<polyline points="${line}" fill="none" stroke="${sr.color}" stroke-width="1.4" vector-effect="non-scaling-stroke"/>`;
+  }
+  return out + '</svg>';
+}
+
+function renderGpus() {
+  if (!status) return;
+  const el = $('gpus'), s = status.server, live = ['starting', 'running'].includes(s.state);
+  if (!status.gpus.length) { el.innerHTML = '<div class="note">nvidia-smi not available</div>'; return; }
+  const win = mbuf.slice(-300), last = mbuf[mbuf.length - 1];
+  el.innerHTML = status.gpus.map(g => {
+    const mine = s.gpus.includes(g.index) && live;
+    const cur = last && last.gpus.find(x => x[0] === g.index);
+    const used = cur ? cur[1] : g.mem_used, util = cur ? cur[2] : g.util;
+    const at = (x, k) => { const e = x.gpus.find(y => y[0] === g.index); return e ? e[k] : null; };
+    const col = mine ? 'var(--acc)' : '#8f9db3';
+    const sp = spark(win, [{ v: x => { const m = at(x, 1); return m == null || !g.mem_total ? null : m / g.mem_total; }, color: col, fill: true },
+                           { v: x => { const u = at(x, 2); return u == null ? null : u / 100; }, color: col }], 300, 1);
+    return `<div class="gcard ${mine ? 'mine' : ''}"><div class="hd"><span class="idx">GPU ${g.index}</span><span class="note">${esc(g.name || '')}${g.temp != null ? ' · ' + g.temp + '°C' : ''}</span></div>
+      <div class="bar"><i style="width:${pctOf(used, g.mem_total).toFixed(1)}%"></i></div>
+      <div class="ft"><span>${gib(used)} / ${gib(g.mem_total)} GiB</span><span>util ${util ?? '?'}%</span></div>${sp}</div>`;
+  }).join('');
+}
+
+function stackBar(parts, total) {
+  return '<div class="sbar">' + parts.map(p => `<i title="${p.t}" style="width:${pctOf(p.v, total).toFixed(2)}%;background:${p.c}"></i>`).join('') + '</div>';
+}
+function renderRam() {
+  if (!status || !status.mem) return;
+  const m = status.mem, rows = [];
+  // whole container view: used = total - available; cache = reclaimable part (available - free)
+  if (m.total_mib) {
+    const used = m.used_mib != null ? m.used_mib : m.total_mib - (m.available_mib || 0);
+    const cache = Math.max(0, (m.available_mib || 0) - (m.free_mib || 0));
+    rows.push(`<div class="nodebar"><span>total</span>${stackBar([{ v: used, c: 'var(--acc)', t: 'used ' + gib(used) + ' GiB' }, { v: cache, c: '#3d5f8f', t: 'cache ' + gib(cache) + ' GiB' }], m.total_mib)}<span>${gib(used)} used / ${gib(m.total_mib)} GiB</span></div>`);
+    $('kRam').textContent = gib(used) + ' / ' + gib(m.total_mib) + ' GiB';
+    $('kRam').title = `available ${gib(m.available_mib)} GiB (counts reclaimable cache)\ncached ${gib(m.cached_mib)} GiB, free ${gib(m.free_mib)} GiB` + (m.cgroup ? `\ncgroup ${gib(m.cgroup.used_mib)} GiB` + (m.cgroup.limit_mib ? ' / ' + gib(m.cgroup.limit_mib) : '') : '');
+  }
+  for (const n of m.nodes || []) {
+    const cache = Math.min(n.cached_mib || 0, n.used_mib), app = n.used_mib - cache;
+    rows.push(`<div class="nodebar"><span>node ${n.node}</span>${stackBar([{ v: app, c: 'var(--acc)', t: 'used ' + gib(app) + ' GiB' }, { v: cache, c: '#3d5f8f', t: 'cache ' + gib(cache) + ' GiB' }], n.total_mib)}<span>${gib(app)} + ${gib(cache)} cache / ${gib(n.total_mib)} GiB</span></div>`);
+  }
+  $('ramBars').innerHTML = rows.join('') || '<div class="note">no memory info</div>';
+  const mx = m.total_mib || 1, win = mbuf.slice(-600);
+  $('ramSpark').innerHTML = spark(win, [{ v: x => x.ram_used, color: 'var(--acc)', fill: true }, { v: x => x.rss, color: 'var(--ok)' }], 600, mx, 56);
+  $('ramSparkNote').textContent = '(blue = used, green = llama-server RSS)';
+  const c = m.child || {}, kv = [];
+  kv.push(`<div><b>${c.rss_mib != null ? gib(c.rss_mib) + ' GiB' : '–'}</b><span>llama-server RSS</span></div>`);
+  kv.push(`<div><b>${c.read_bytes != null ? (c.read_bytes / 2 ** 30).toFixed(1) + ' GiB' : '–'}</b><span>llama-server read from disk</span></div>`);
+  kv.push(`<div><b>${gib(m.available_mib)} GiB</b><span>available (incl. cache)</span></div>`);
+  if (m.swap_total_mib) kv.push(`<div><b>${gib(m.swap_used_mib)} / ${gib(m.swap_total_mib)} GiB</b><span>swap</span></div>`);
+  $('ramKv').innerHTML = kv.join('');
+  $('ramNote').textContent = mbuf.length ? 'live' : '';
+}
+
+function renderCpu() {
+  const last = mbuf[mbuf.length - 1];
+  if (!last) return;
+  const ids = mMeta.cpu_ids || [], pin = new Set(mMeta.cpus_pinned || []);
+  $('cpuGrid').innerHTML = last.cpu.map((b, i) => {
+    const id = ids[i] != null ? ids[i] : i;
+    return `<i class="${pin.has(id) ? 'pin' : ''}" title="cpu ${id}: ${b}%${pin.has(id) ? ' (pinned)' : ''}" style="opacity:${(0.12 + 0.88 * b / 100).toFixed(2)}"></i>`;
+  }).join('');
+  const avg = last.cpu.length ? Math.round(last.cpu.reduce((a, b) => a + b, 0) / last.cpu.length) : 0;
+  const pb = last.cpu.filter((_, i) => pin.has(ids[i]));
+  $('cpuNote').textContent = `${last.cpu.length} cores · avg ${avg}%` + (pb.length ? ` · pinned avg ${Math.round(pb.reduce((a, b) => a + b, 0) / pb.length)}%` : '');
+}
+
+function renderGen() {
+  if (!status) return;
+  const s = status.server;
+  $('kGen').textContent = s.state !== 'running' ? s.state : (s.inflight ? `generating ×${s.inflight}` : 'idle');
+  $('kGen').className = s.inflight ? 's-running' : '';
+}
+
 /* ---- tabs: selected tab lives in location.hash ---- */
 const TABS = ['dashboard', 'chat', 'profiles', 'kev', 'logs', 'access'];
-let curTab = 'dashboard';
-const tabHooks = {};   // name -> {show(), hide()}
 function showTab(t) {
   if (!TABS.includes(t)) t = 'dashboard';
   if (t !== curTab && tabHooks[curTab] && tabHooks[curTab].hide) tabHooks[curTab].hide();
