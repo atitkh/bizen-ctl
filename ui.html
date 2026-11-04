@@ -104,6 +104,9 @@
   .devrow { display: grid; grid-template-columns: 120px 1fr 170px; gap: 10px; align-items: center; font-size: 12.5px; padding: 3px 0; font-variant-numeric: tabular-nums; }
   .layerstrip { display: flex; height: 18px; border-radius: 3px; overflow: hidden; border: 1px solid var(--line); background: #232a35; }
   .layerstrip i { flex: 1 1 0; min-width: 2px; }
+  .genbig { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .strip { display: grid; grid-template-columns: 54px 1fr; gap: 8px; align-items: center; font-size: 12px; margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+  .strip svg { display: block; width: 100%; height: 14px; background: #0d1015; border-radius: 2px; }
   @media (max-width: 860px) { .pane { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -155,6 +158,17 @@
     <div id="loadDevs" style="margin-top:10px"></div>
     <div id="loadLayers"></div>
     <details id="loadFit" style="display:none"><summary>fit / memory-plan lines from the log</summary><pre id="loadFitText" style="margin-top:6px"></pre></details>
+  </section>
+
+  <section class="wide" id="genPanel">
+    <h2>Generation <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="genNote"></span></h2>
+    <div class="row" style="align-items:flex-end;gap:24px;flex-wrap:nowrap">
+      <div style="min-width:170px"><div class="genbig" id="genTps">–</div><div class="note" id="genSub">tok/s</div></div>
+      <div style="flex:1"><div class="note" style="margin-bottom:3px">tok/s, last 3 min</div><div id="genSpark"></div></div>
+    </div>
+    <div class="note" style="margin:12px 0 4px">GPU utilisation, last 3 min <span id="genStripNote"></span></div>
+    <div id="genStrips"></div>
+    <div class="legend"><span><i style="background:var(--ok)"></i>generating</span><span><i style="background:var(--acc)"></i>GPU util (brighter = busier)</span></div>
   </section>
 
   <section class="wide">
@@ -622,7 +636,7 @@ async function refresh() {
   if (s.state === 'failed') { b.className = 'banner bad'; b.textContent = s.error; }
   else if (s.restart_needed) { b.className = 'banner warn'; b.innerHTML = 'The running server uses an older profile or a different one than the active profile. <a href="#" style="color:inherit" onclick="act(\'restart\');return false">Restart to apply</a>.'; }
   else b.className = 'banner';
-  renderGpus(); renderRam(); renderGen(); renderLoad();
+  renderGpus(); renderRam(); renderGen(); renderLoad(); renderGenPanel();
 }
 async function refreshLogs() {
   try {
@@ -664,7 +678,7 @@ async function pollMetrics() {
     for (const x of d.samples) if (x.t > mT) { mbuf.push(x); mT = x.t; }
     const cut = (d.now || Date.now() / 1000) - 620;
     while (mbuf.length && mbuf[0].t < cut) mbuf.shift();
-    renderGpus(); renderRam(); renderCpu();
+    renderGpus(); renderRam(); renderCpu(); renderGenPanel();
   } catch {} finally { mBusy = false; }
 }
 tabHooks.dashboard = { show() { pollMetrics(); } };
@@ -839,6 +853,44 @@ async function dlStartupLog() {
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   } catch (e) { toast('could not fetch the log', true); }
+}
+
+
+/* ---- generation panel: samples[].gen (1 s) + status.server.gen ---- */
+function renderGenPanel() {
+  if (!status || !$('genTps')) return;
+  const s = status.server, g = (mbuf.length && mbuf[mbuf.length - 1].gen) || s.gen || {};
+  const live = g.active && g.tps != null;
+  $('genTps').textContent = live ? g.tps.toFixed(1) : (g.active ? '…' : '–');
+  $('genTps').style.color = live ? 'var(--ok)' : 'var(--dim)';
+  $('genSub').textContent = g.active ? `tok/s · ${g.tokens != null ? g.tokens : 0} tokens${g.ttft_s != null ? ' · first token after ' + g.ttft_s + ' s' : ' · waiting for first token'}${g.requests > 1 ? ' · ' + g.requests + ' requests' : ''}`
+    : (g.last_tps != null ? `idle · last request ${g.last_tps} tok/s` : (s.state === 'running' ? 'idle' : 'tok/s'));
+  $('genNote').textContent = g.active ? 'generating' : '';
+  const last = mbuf[mbuf.length - 1];
+  if (!last) return;
+  const WIN = 180, t0 = last.t - WIN, win = mbuf.filter(x => x.t > t0);
+  const mx = Math.max(10, ...win.map(x => (x.gen && x.gen.tps) || 0));
+  $('genSpark').innerHTML = spark(win, [{ v: x => x.gen && x.gen.tps != null && x.gen.active ? x.gen.tps : null, color: 'var(--ok)', fill: true }], WIN, mx, 56);
+  const W = 600, dx = Math.max(1, W / WIN * 1.05), X = t => ((t - t0) / WIN * W).toFixed(1);
+  const ids = s.gpus && s.gpus.length ? s.gpus : [];
+  let rows = '';
+  // top row: spans where a request was generating (consecutive active samples merged)
+  let runs = [], cur = null;
+  for (const x of win) {
+    if (x.gen && x.gen.active) { if (!cur) runs.push(cur = [x.t, x.t]); else cur[1] = x.t; } else cur = null;
+  }
+  rows += `<div class="strip"><span class="note">gen</span><svg viewBox="0 0 ${W} 14" preserveAspectRatio="none">${runs.map(r => `<rect x="${X(r[0])}" y="2" width="${Math.max(dx, (r[1] - r[0]) / WIN * W + dx).toFixed(1)}" height="10" rx="2" fill="var(--ok)"/>`).join('')}</svg></div>`;
+  for (const gi of ids) {
+    let r = '';
+    for (const x of win) {
+      const e = x.gpus.find(y => y[0] === gi);
+      if (!e || e[2] == null) continue;
+      r += `<rect x="${X(x.t)}" y="0" width="${dx.toFixed(1)}" height="14" fill="var(--acc)" fill-opacity="${(0.04 + 0.96 * e[2] / 100).toFixed(2)}"><title>GPU ${gi}: ${e[2]}%</title></rect>`;
+    }
+    rows += `<div class="strip"><span>GPU ${gi}</span><svg viewBox="0 0 ${W} 14" preserveAspectRatio="none">${r}</svg></div>`;
+  }
+  $('genStrips').innerHTML = rows;
+  $('genStripNote').textContent = ids.length ? '' : '(no GPUs in use: model not loaded)';
 }
 
 /* ---- chat: streams /api/chat (SSE) ---- */

@@ -33,6 +33,7 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
 TPS_RE = re.compile(r"eval time\s*=.*?([\d.]+)\s*tokens per second")
 PROMPT_TPS_RE = re.compile(r"prompt eval time\s*=.*?([\d.]+)\s*tokens per second")
+GEN_PATHS = ("/v1/chat/completions", "/v1/completions", "/completion", "/chat/completions", "/completions")
 # load phases, in order; each log line can only move the phase forward. Patterns are llama.cpp-style and optional.
 LOAD_PHASES = ["starting", "reading tensors", "allocating/warming", "ready"]
 PHASE_RES = [
@@ -480,6 +481,49 @@ def meminfo(pid=None):
     return out
 
 
+class SSECount:
+    """Counts token-bearing `data:` events in a stream that arrives in arbitrary pieces. Observes only;
+    what is relayed to the client is never touched. Never raises."""
+
+    def __init__(self):
+        self.buf = b""
+
+    @staticmethod
+    def _token_event(raw):
+        if not raw or raw == b"[DONE]":
+            return 0
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return 1
+        if not isinstance(d, dict) or "error" in d or "bizen" in d:
+            return 0
+        ch = d.get("choices")
+        if isinstance(ch, list):
+            c = ch[0] if ch and isinstance(ch[0], dict) else {}
+            delta = c.get("delta") if isinstance(c.get("delta"), dict) else {}
+            return 1 if (delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls") or c.get("text")) else 0
+        return 1 if d.get("content") else 0
+
+    def feed(self, data):
+        n = 0
+        try:
+            self.buf = (self.buf + data).replace(b"\r\n", b"\n")
+            while True:
+                i = self.buf.find(b"\n\n")
+                if i < 0:
+                    break
+                ev, self.buf = self.buf[:i], self.buf[i + 2:]
+                for line in ev.split(b"\n"):
+                    if line.startswith(b"data:"):
+                        n += self._token_event(line[5:].strip())
+            if len(self.buf) > (1 << 20):
+                self.buf = b""
+        except Exception:  # noqa: BLE001
+            self.buf = b""
+        return n
+
+
 # ---------------------------------------------------------------- supervisor
 
 class Supervisor:
@@ -503,6 +547,10 @@ class Supervisor:
         self.last_tps = None
         self.last_prompt_tps = None
         self._load_reset(None)
+        self.gen_reqs = {}                    # id -> {started, first, tokens, last}; guarded by self.lock
+        self.gen_next = 0
+        self.gen_recent = collections.deque(maxlen=512)   # arrival times of recent token chunks
+        self.gen_last_tps = None
         self.internal_key = secrets.token_urlsafe(24)
         self.ready_event = threading.Event()
         self.switch_lock = threading.Lock()   # serialises routed profile switches
@@ -577,6 +625,61 @@ class Supervisor:
                         out["mbps"] = round(max(0, self.load_hist[-1][1] - old[1]) / dt / 1e6, 1)
                 if out["mbps"] and total and self.load_phase < 2 and self.load_bytes < total:
                     out["eta_s"] = int((total - self.load_bytes) / (out["mbps"] * 1e6))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    # -- generation stats (counted from the SSE chunks that pass through the proxy; one chunk ~ one token)
+    def gen_begin(self):
+        with self.lock:
+            self.gen_next += 1
+            self.gen_reqs[self.gen_next] = {"started": time.time(), "first": None, "tokens": 0, "last": None}
+            return self.gen_next
+
+    def gen_chunk(self, gid, n):
+        if n <= 0:
+            return
+        with self.lock:
+            r = self.gen_reqs.get(gid)
+            if r:
+                now = time.time()
+                if r["first"] is None:
+                    r["first"] = now
+                r["tokens"] += n
+                r["last"] = now
+                self.gen_recent.extend([now] * min(n, 64))
+
+    def gen_end(self, gid, tokens=None, tps=None):
+        """Finish a request. tokens/tps (from a non-streamed reply's usage/timings) fill in when no chunks were seen."""
+        with self.lock:
+            r = self.gen_reqs.pop(gid, None)
+            if not r:
+                return
+            if tokens and not r["tokens"]:
+                r["tokens"] = int(tokens)
+            if tps is None and r["tokens"] >= 2 and r["first"] and r["last"] and r["last"] > r["first"]:
+                tps = (r["tokens"] - 1) / (r["last"] - r["first"])
+            if tps:
+                self.gen_last_tps = round(float(tps), 2)
+
+    def gen_info(self):
+        """{active, requests, tokens, ttft_s, tps, last_tps}. tokens/ttft_s belong to the newest running request
+        (None when idle); tps is the live rate over the last ~3 s (None until the first token); last_tps is the
+        average of the last finished request. Never raises."""
+        out = {"active": False, "requests": 0, "tokens": None, "ttft_s": None, "tps": None, "last_tps": self.gen_last_tps}
+        try:
+            with self.lock:
+                out["requests"] = len(self.gen_reqs)
+                out["active"] = bool(self.gen_reqs)
+                if self.gen_reqs:
+                    r = self.gen_reqs[max(self.gen_reqs)]
+                    out["tokens"] = r["tokens"]
+                    if r["first"]:
+                        out["ttft_s"] = round(r["first"] - r["started"], 2)
+                    now = time.time()
+                    ev = [t for t in self.gen_recent if now - t <= 3.0]
+                    if r["first"]:
+                        out["tps"] = round((len(ev) - 1) / (ev[-1] - ev[0]), 1) if len(ev) >= 2 and ev[-1] > ev[0] and now - ev[-1] <= 2.0 else 0.0
         except Exception:  # noqa: BLE001
             pass
         return out
@@ -815,6 +918,7 @@ class Supervisor:
                 "last_tps": self.last_tps, "last_prompt_tps": self.last_prompt_tps,
                 "restart_needed": stale,
                 "load": self.load_info(),
+                "gen": self.gen_info(),
             }
 
 
@@ -1162,7 +1266,7 @@ class Sampler:
                 "nodes": [n["used_mib"] for n in mem["nodes"]],
                 "gpus": [[g["index"], g["mem_used"], g["util"]] for g in gpu_info()],
                 "cpu": busy, "rss": mem["child"]["rss_mib"], "read_bytes": mem["child"]["read_bytes"],
-                "load": self._safe("load_info", mem["child"])}
+                "load": self._safe("load_info", mem["child"]), "gen": self._safe("gen_info")}
 
     def _loop(self):
         while True:
@@ -1429,6 +1533,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sup = self.sup
         sup.touch(+1)
         c = None
+        gid = None
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1453,6 +1558,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c = http.client.HTTPConnection("127.0.0.1", self.cfg.get("internal_port"), timeout=600)
             c.request("POST", "/v1/chat/completions", body=json.dumps(payload),
                       headers={"Content-Type": "application/json", "Authorization": f"Bearer {sup.internal_key}"})
+            gid = sup.gen_begin()
+            counter = SSECount()
             r = c.getresponse()
             if r.status != 200:
                 return emit({"error": r.read()[:500].decode(errors="replace") or f"upstream status {r.status}"})
@@ -1463,6 +1570,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 sup.last_activity = time.time()
+                sup.gen_chunk(gid, counter.feed(chunk))
         except (BrokenPipeError, ConnectionResetError):
             pass   # browser hit Stop: closing the upstream connection below stops generation
         except OSError as e:
@@ -1473,6 +1581,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             if c:
                 c.close()
+            if gid:
+                sup.gen_end(gid)
             sup.touch(-1)
 
     def test_prompt(self, prompt, profile=None, decision=None):
@@ -1521,6 +1631,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.body()
         sup.touch(+1)
         target, extra = None, {}
+        gid, tail, tokens, tps = None, b"", None, None
         try:
             if method == "POST" and router.enabled() and path in ("/v1/chat/completions", "/v1/completions"):
                 try:
@@ -1550,8 +1661,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if body:
                 headers["Content-Length"] = str(len(body))
             c = http.client.HTTPConnection("127.0.0.1", self.cfg.get("internal_port"), timeout=3600)
+            if method == "POST" and path in GEN_PATHS:
+                gid = sup.gen_begin()
+            counter = SSECount()
             c.request(method, self.path, body=body or None, headers=headers)
             r = c.getresponse()
+            streamed = "event-stream" in (r.getheader("Content-Type") or "")
             self.send_response(r.status, r.reason)
             for k, v in r.getheaders():
                 if k.lower() not in HOP_HEADERS:
@@ -1567,13 +1682,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 sup.last_activity = time.time()
+                if gid:
+                    if streamed:
+                        sup.gen_chunk(gid, counter.feed(chunk))
+                    elif len(tail) < (2 << 20):
+                        tail += chunk
             c.close()
+            if gid and not streamed and tail:
+                try:   # a non-streamed reply: take the totals from its usage/timings
+                    rep = json.loads(tail)
+                    tokens = (rep.get("usage") or {}).get("completion_tokens") or (rep.get("timings") or {}).get("predicted_n")
+                    tps = (rep.get("timings") or {}).get("predicted_per_second")
+                except (ValueError, AttributeError):
+                    pass
         except OSError as e:
             try:
                 self.send_json({"error": {"message": f"upstream error: {e}", "type": "upstream"}}, 502)
             except OSError:
                 pass
         finally:
+            if gid:
+                sup.gen_end(gid, tokens, tps)
             sup.touch(-1)
 
 
