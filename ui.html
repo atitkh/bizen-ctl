@@ -14,7 +14,13 @@
   header { display: flex; align-items: center; gap: 14px; padding: 14px 22px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
   header .sp { flex: 1; }
-  main { max-width: 1180px; margin: 0 auto; padding: 18px 22px 60px; display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+  main { max-width: 1180px; margin: 0 auto; padding: 12px 22px 60px; }
+  .pane { display: none; gap: 16px; grid-template-columns: 1fr 1fr; }
+  .pane.on { display: grid; }
+  .nav { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; overflow-x: auto; }
+  .nav a { padding: 8px 16px; color: var(--dim); text-decoration: none; font-size: 13.5px; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+  .nav a:hover { color: var(--text); }
+  .nav a.sel { color: var(--acc); border-bottom-color: var(--acc); }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
   section.wide { grid-column: 1 / -1; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 12px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -68,7 +74,7 @@
   .prob.top .bar i { background: var(--acc); }
   details { margin-top: 12px; }
   summary { cursor: pointer; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-  @media (max-width: 860px) { main { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 860px) { .pane { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -90,6 +96,15 @@
 </header>
 
 <main>
+  <nav id="nav" class="nav">
+    <a href="#dashboard" data-tab="dashboard">Dashboard</a>
+    <a href="#chat" data-tab="chat">Chat</a>
+    <a href="#profiles" data-tab="profiles">Profiles</a>
+    <a href="#kev" data-tab="kev">Kev</a>
+    <a href="#logs" data-tab="logs">Logs</a>
+    <a href="#access" data-tab="access">Access</a>
+  </nav>
+  <div class="pane" id="pane-dashboard" data-tab="dashboard">
   <section class="wide">
     <div id="banner" class="banner"></div>
     <div class="kv">
@@ -109,17 +124,18 @@
   </section>
 
   <section>
-    <h2>Behaviour</h2>
-    <div class="grid2">
-      <div><label>Unload after idle (minutes, 0 = never)</label><input id="ttl" type="number" min="0"></div>
-      <div style="display:flex;align-items:end"><label class="check"><input id="keep" type="checkbox"> Keep loaded (ignore idle unload)</label></div>
-      <div class="full"><label>Client endpoint</label>
-        <pre class="cmd" id="endpoint"></pre></div>
-    </div>
-    <div class="row" style="margin-top:12px"><button class="primary" onclick="saveBehaviour()">Save</button>
-      <span class="note">Cold start after an unload takes about as long as the last load time.</span></div>
+    <h2>Test prompt</h2>
+    <textarea id="prompt" rows="3">Explain mixture-of-experts models in three sentences.</textarea>
+    <div class="row" style="margin-top:8px"><button class="primary" id="btnTest" onclick="testPrompt()">Send</button><span class="note" id="testMeta"></span></div>
+    <pre id="testOut" style="margin-top:10px;max-height:260px;overflow:auto"></pre>
   </section>
 
+  </div>
+  <div class="pane" id="pane-chat" data-tab="chat">
+  <section class="wide" id="chatPlaceholder"><h2>Chat</h2><div class="note">coming in the next step</div></section>
+
+  </div>
+  <div class="pane" id="pane-profiles" data-tab="profiles">
   <section class="wide">
     <h2>Profiles <span class="sp"></span>
       <button onclick="newProfile()">New</button><button onclick="dupProfile()">Duplicate</button>
@@ -149,6 +165,20 @@
     <pre class="cmd" id="preview" style="margin-top:10px;display:none"></pre>
   </section>
 
+  <section>
+    <h2>Behaviour</h2>
+    <div class="grid2">
+      <div><label>Unload after idle (minutes, 0 = never)</label><input id="ttl" type="number" min="0"></div>
+      <div style="display:flex;align-items:end"><label class="check"><input id="keep" type="checkbox"> Keep loaded (ignore idle unload)</label></div>
+      <div class="full"><label>Client endpoint</label>
+        <pre class="cmd" id="endpoint"></pre></div>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="primary" onclick="saveBehaviour()">Save</button>
+      <span class="note">Cold start after an unload takes about as long as the last load time.</span></div>
+  </section>
+
+  </div>
+  <div class="pane" id="pane-kev" data-tab="kev">
   <section class="wide">
     <h2>Router (Kev) <span class="sp"></span><span id="kevState" class="pill s-stopped">Kev stopped</span>
       <button onclick="kevAct('start')">Start Kev</button><button class="danger" onclick="kevAct('stop')">Stop Kev</button></h2>
@@ -196,20 +226,20 @@
       <span class="note" id="rtMeta"></span></div>
     <div id="rtResult" style="margin-top:10px"></div>
     <pre id="rtText" style="margin-top:8px;max-height:220px;overflow:auto"></pre>
-    <h2 style="margin-top:18px">Endpoints</h2>
-    <pre class="cmd" id="rtEndpoints"></pre>
     <details id="kevLogBox"><summary>Kev log</summary>
       <div id="kevLogs" style="height:200px;overflow:auto;background:#0b0e12;border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin-top:10px"><pre id="kevLogText"></pre></div>
     </details>
   </section>
 
-  <section>
-    <h2>Test prompt</h2>
-    <textarea id="prompt" rows="3">Explain mixture-of-experts models in three sentences.</textarea>
-    <div class="row" style="margin-top:8px"><button class="primary" id="btnTest" onclick="testPrompt()">Send</button><span class="note" id="testMeta"></span></div>
-    <pre id="testOut" style="margin-top:10px;max-height:260px;overflow:auto"></pre>
+  </div>
+  <div class="pane" id="pane-logs" data-tab="logs">
+  <section class="wide">
+    <h2>llama-server log <span class="sp"></span><label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input id="follow" type="checkbox" checked> follow</label></h2>
+    <div id="logs"><pre id="logtext"></pre></div>
   </section>
 
+  </div>
+  <div class="pane" id="pane-access" data-tab="access">
   <section>
     <h2>Access</h2>
     <label>API keys (one per line; clients send <code>Authorization: Bearer &lt;key&gt;</code>)</label>
@@ -221,10 +251,12 @@
       <span class="note">Needed only after changing the listen port. Service: <span id="unit">?</span></span></div>
   </section>
 
-  <section class="wide">
-    <h2>llama-server log <span class="sp"></span><label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input id="follow" type="checkbox" checked> follow</label></h2>
-    <div id="logs"><pre id="logtext"></pre></div>
+  <section>
+    <h2>Endpoints</h2>
+    <pre class="cmd" id="rtEndpoints"></pre>
   </section>
+
+  </div>
 </main>
 <div id="toast"></div>
 
@@ -544,8 +576,26 @@ async function init() {
   try { await loadConfig(); } catch { return; }
   loadModels(); loadKevPresets(); refresh(); refreshLogs();
   $('logs').scrollTop = 1e9;
-  if (!window._timers) window._timers = [setInterval(refresh, 2000), setInterval(refreshLogs, 2000)];
+  if (!window._timers) window._timers = [setInterval(() => { if (!document.hidden) refresh(); }, 2000),
+    setInterval(() => { if (!document.hidden && (curTab === 'logs' || curTab === 'kev')) refreshLogs(); }, 2000)];
 }
+
+/* ---- tabs: selected tab lives in location.hash ---- */
+const TABS = ['dashboard', 'chat', 'profiles', 'kev', 'logs', 'access'];
+let curTab = 'dashboard';
+const tabHooks = {};   // name -> {show(), hide()}
+function showTab(t) {
+  if (!TABS.includes(t)) t = 'dashboard';
+  if (t !== curTab && tabHooks[curTab] && tabHooks[curTab].hide) tabHooks[curTab].hide();
+  curTab = t;
+  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.dataset.tab === t));
+  document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('sel', a.dataset.tab === t));
+  if (tabHooks[t] && tabHooks[t].show) tabHooks[t].show();
+  if (t === 'logs' || t === 'kev') refreshLogs();
+}
+tabHooks.logs = { show() { setTimeout(() => { if ($('follow').checked) $('logs').scrollTop = 1e9; }, 50); } };
+window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
+showTab(location.hash.slice(1));
 init();
 </script>
 </body>
