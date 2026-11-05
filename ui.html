@@ -65,6 +65,15 @@
   .check input { width: auto; }
   #toast { position: fixed; bottom: 18px; right: 18px; background: #222935; border: 1px solid #2f3846; padding: 9px 14px; border-radius: 6px; opacity: 0; transition: opacity .2s; pointer-events: none; }
   #toast.on { opacity: 1; } #toast.err { border-color: var(--bad); color: var(--bad); }
+  .lib { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .lib th { text-align: left; font-size: 11.5px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  .lib td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .lib td .sub { font-size: 11.5px; color: var(--dim); word-break: break-all; }
+  .lib td.act { white-space: nowrap; text-align: right; } .lib td.act button { margin-left: 6px; }
+  .lib .chips { margin-top: 3px; }
+  .empty { padding: 26px 10px; text-align: center; color: var(--dim); }
+  #libModal { position: fixed; inset: 0; background: rgba(8,10,14,.7); display: none; align-items: center; justify-content: center; z-index: 6; }
+  #libModal .box { width: 420px; max-width: 92vw; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 10px; }
   #login { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 5; }
   #login form { width: 300px; display: grid; gap: 10px; }
   .key { font-family: var(--mono); font-size: 12.5px; }
@@ -99,6 +108,7 @@
   .cpugrid i.pin { border-color: var(--warn); }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
   .chip { font-size: 11.5px; padding: 2px 9px; border-radius: 10px; border: 1px solid var(--line); color: var(--dim); }
+  .chip.warn { color: var(--warn); border-color: #574617; } .chip.bad { color: var(--bad); border-color: #6b2c2c; }
   .chip.done { color: var(--text); background: #1a212b; } .chip.cur { color: var(--bg); background: var(--warn); border-color: var(--warn); } .chip.ok { color: var(--bg); background: var(--ok); border-color: var(--ok); }
   .loadbar { height: 16px; } .loadbar i { background: var(--acc); transition: width .6s linear; }
   .devrow { display: grid; grid-template-columns: 120px 1fr 170px; gap: 10px; align-items: center; font-size: 12.5px; padding: 3px 0; font-variant-numeric: tabular-nums; }
@@ -133,6 +143,7 @@
     <a href="#dashboard" data-tab="dashboard">Dashboard</a>
     <a href="#chat" data-tab="chat">Chat</a>
     <a href="#profiles" data-tab="profiles">Profiles</a>
+    <a href="#library" data-tab="library">Library</a>
     <a href="#kev" data-tab="kev">Kev</a>
     <a href="#logs" data-tab="logs">Logs</a>
     <a href="#system" data-tab="system">System</a>
@@ -265,6 +276,19 @@
   </section>
 
   </div>
+  <div class="pane" id="pane-library" data-tab="library">
+  <section class="wide">
+    <h2>Library <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="libAge"></span><button id="libRefresh" onclick="loadLibrary(true)">Refresh</button></h2>
+    <div class="chips" id="libHead" style="margin-bottom:10px"></div>
+    <div id="libList"></div>
+  </section>
+  </div>
+  <div id="libModal"><div class="box">
+    <h2 style="margin:0">Delete model files</h2>
+    <div class="note" id="libModalInfo"></div>
+    <div><label>Type the model name to confirm: <code id="libModalName"></code></label><input id="libModalIn" class="key" autocomplete="off" oninput="libModalCheck()"></div>
+    <div class="row" style="justify-content:flex-end"><button onclick="libModalClose()">Cancel</button><button class="danger" id="libModalGo" disabled onclick="libDeleteGo()">Delete forever</button></div>
+  </div></div>
   <div class="pane" id="pane-kev" data-tab="kev">
   <section class="wide">
     <h2>Router (Kev) <span class="sp"></span><span id="kevState" class="pill s-stopped">Kev stopped</span>
@@ -374,6 +398,7 @@
 
 <script>
 let cfg = null, sel = null, status = null, sysInfo = null;
+let draftProf = null;   // unsaved profile from the Library tab; lives only in the browser until Save
 let curTab = 'dashboard';
 const tabHooks = {};   // tab name -> {show(), hide()}
 const $ = id => document.getElementById(id);
@@ -398,7 +423,7 @@ async function login(e) {
 
 async function loadConfig() {
   cfg = await api('/api/config');
-  if (!sel || !cfg.profiles.find(p => p.name === sel)) sel = cfg.active_profile;
+  if (!sel || (!(draftProf && draftProf.name === sel) && !cfg.profiles.find(p => p.name === sel))) sel = cfg.active_profile;
   $('ttl').value = cfg.idle_ttl_min; $('keep').checked = cfg.keep_loaded;
   $('keys').value = cfg.api_keys.join('\n');
   const host = location.hostname, port = location.port || 80;
@@ -564,16 +589,18 @@ async function routeTest(run) {
 
 function renderTabs() {
   $('tabs').innerHTML = cfg.profiles.map(p =>
-    `<span class="tab ${p.name === sel ? 'sel' : ''}" onclick="selectProfile('${p.name}')">${p.name}${p.name === cfg.active_profile ? '<span class="star">● active</span>' : ''}</span>`).join('');
+    `<span class="tab ${p.name === sel ? 'sel' : ''}" onclick="selectProfile('${p.name}')">${p.name}${p.name === cfg.active_profile ? '<span class="star">● active</span>' : ''}</span>`).join('') +
+    (draftProf ? `<span class="tab ${draftProf.name === sel ? 'sel' : ''}" style="border-style:dashed" onclick="selectProfile('${draftProf.name}')" title="From the Library, not saved yet">${draftProf.name}<span class="star" style="color:var(--warn)">● unsaved</span></span>` : '');
 }
 function selectProfile(n) { sel = n; renderTabs(); fillForm(); $('preview').style.display = 'none'; }
-function curProfile() { return cfg.profiles.find(p => p.name === sel); }
+function curProfile() { return draftProf && draftProf.name === sel ? draftProf : cfg.profiles.find(p => p.name === sel); }
 function fillForm() {
   const p = curProfile(); if (!p) return;
   document.querySelectorAll('#pform [data-k]').forEach(el => {
     const v = p[el.dataset.k];
     if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? '';
   });
+  $('pnote').textContent = draftProf && draftProf.name === sel ? 'Unsaved draft from the Library: review, then Save.' : '';
 }
 function readForm() {
   const p = { ...curProfile() };
@@ -593,10 +620,12 @@ async function putConfig(c, msg) {
 async function saveProfile(activate) {
   const p = readForm(), old = sel;
   const c = structuredClone(cfg);
-  c.profiles = c.profiles.map(x => x.name === old ? p : x);
-  if (c.active_profile === old || activate) c.active_profile = p.name;
+  const isDraft = !!(draftProf && draftProf.name === old);
+  if (isDraft) c.profiles.push(p); else c.profiles = c.profiles.map(x => x.name === old ? p : x);
+  if ((!isDraft && c.active_profile === old) || activate) c.active_profile = p.name;
   try {
     sel = p.name; await putConfig(c, activate ? 'Saved, restarting…' : 'Profile saved');
+    if (isDraft) { draftProf = null; renderTabs(); fillForm(); }
     if (activate) await act('restart');
   } catch (e) { sel = old; toast(e.message, true); }
 }
@@ -612,6 +641,7 @@ async function dupProfile() {
   try { sel = name; await putConfig(c, 'Duplicated'); } catch (e) { toast(e.message, true); }
 }
 async function delProfile() {
+  if (draftProf && draftProf.name === sel) { draftProf = null; sel = cfg.active_profile; renderTabs(); fillForm(); return toast('Draft discarded'); }
   if (sel === cfg.active_profile) return toast('Make another profile active first', true);
   if (!confirm(`Delete profile ${sel}?`)) return;
   const c = structuredClone(cfg); c.profiles = c.profiles.filter(p => p.name !== sel);
@@ -1172,8 +1202,78 @@ async function sysClearToken() {
 ['sDl', 'sHf', 'sLs', 'sEp', 'sMin', 'sTok'].forEach(i => $(i).addEventListener('input', () => { sysFormDirty = true; }));
 tabHooks.system = { show() { if (!sysLoaded) loadSystem(false); } };
 
+/* ---- Library tab: models on disk (GET /api/library, POST /api/library/delete, POST /api/library/profile) ---- */
+let libData = null, libBusy = false, libDel = null;
+const libSize = b => b >= 2 ** 30 ? (b / 2 ** 30).toFixed(1) + ' GiB' : (b / 2 ** 20).toFixed(0) + ' MiB';
+const LIB_FIT = { 'fits-vram': ['fits VRAM', 'ok'], 'needs-ram': ['needs RAM', 'warn'], 'too-big': ['too big', 'bad'] };
+function libRow(m) {
+  const n = m.shards_expected, partial = !m.complete;
+  const fit = m.fit && LIB_FIT[m.fit.verdict];
+  const busy = m.loaded || (m.used_by || []).length;
+  const why = m.partial ? 'Partial downloads are not deleted here' : m.loaded ? 'Loaded right now: stop the server first' : busy ? 'Used by profile ' + m.used_by.join(', ') : '';
+  const used = (m.used_by || []).map(u => `<span class="chip done">${esc(u)}</span>`).join('');
+  return `<tr>
+    <td><b>${esc(m.name)}</b>${m.mmproj ? ' <span class="chip" title="' + esc(m.mmproj) + '">+ mmproj</span>' : ''}
+      <div class="sub">${esc(m.dir)}</div>${m.hint ? `<div class="sub" style="color:var(--warn)">${esc(m.hint)}</div>` : ''}</td>
+    <td>${m.quant ? `<span class="chip done">${esc(m.quant)}</span>` : '<span class="note">–</span>'}</td>
+    <td>${libSize(m.bytes)}</td>
+    <td>${partial ? `<span class="chip warn" title="${esc(m.hint || '')}">${m.shards_found}/${n}</span>` : n > 1 ? `${n}/${n}` : '1'}</td>
+    <td><div class="chips">${used || '<span class="note">–</span>'}${m.loaded ? '<span class="chip ok">loaded</span>' : ''}</div></td>
+    <td>${fit ? `<span class="chip ${fit[1]}" title="${esc(m.fit.text)}">${fit[0]}</span>` : `<span class="chip" title="${esc(m.fit ? m.fit.text : '')}">?</span>`}</td>
+    <td class="act"><button ${partial ? 'disabled' : ''} onclick="libAddProfile('${m.id}')" title="${partial ? 'Incomplete model' : 'Open a draft profile in the Profiles editor'}">Add as profile</button>
+      <button class="danger" ${busy || m.partial ? 'disabled' : ''} title="${esc(why)}" onclick="libDeleteOpen('${m.id}')">Delete</button></td></tr>`;
+}
+function renderLibrary() {
+  const d = libData || { models: [] }, ms = d.models || [];
+  const tot = ms.reduce((a, m) => a + (m.bytes || 0), 0);
+  const dl = ((sysInfo && sysInfo.disks) || []).find(x => x.role === 'download');
+  $('libHead').innerHTML = `<span class="chip done">${ms.length} model${ms.length === 1 ? '' : 's'}</span><span class="chip done">${libSize(tot)} on disk</span>` +
+    (dl && dl.free_gib != null ? `<span class="chip ${dl.free_gib < Number(((sysInfo.settings || {}).min_free_gib_for_download) || 0) ? 'warn' : 'done'}" title="${esc(dl.path)}">${dl.free_gib} GiB free in ${esc(dl.path)}</span>` : '');
+  $('libAge').textContent = d.ts ? 'scanned ' + new Date(d.ts * 1000).toLocaleTimeString() : '';
+  $('libList').innerHTML = ms.length ? `<table class="lib"><thead><tr><th>Model</th><th>Quant</th><th>Size</th><th>Shards</th><th>Used by</th><th>Fit</th><th></th></tr></thead><tbody>${ms.map(libRow).join('')}</tbody></table>`
+    : `<div class="empty">No models found yet.<br><span class="note">Put .gguf files in a model directory, or set the download directory under <a href="#system" style="color:var(--acc)">System</a> and download one there.</span></div>`;
+}
+async function loadLibrary(manual) {
+  if (libBusy) return; libBusy = true;
+  const b = $('libRefresh'); b.disabled = true; b.textContent = 'Scanning…';
+  try {
+    const [lib, sys] = await Promise.all([api('/api/library'), api('/api/system').catch(() => null)]);
+    libData = lib; if (sys) sysInfo = sys; renderLibrary(); if (manual) toast('Library refreshed');
+  } catch (e) { if (e.message !== 'login') { toast('Library scan failed: ' + e.message, true); $('libAge').textContent = 'unavailable'; } }
+  finally { libBusy = false; b.disabled = false; b.textContent = 'Refresh'; }
+}
+function libFind(id) { return ((libData || {}).models || []).find(m => m.id === id); }
+function libDeleteOpen(id) {
+  const m = libFind(id); if (!m) return;
+  libDel = m;
+  $('libModalName').textContent = m.name;
+  $('libModalInfo').textContent = `${m.shards_found} file${m.shards_found === 1 ? '' : 's'}, ${libSize(m.bytes)} in ${m.dir}. This cannot be undone.`;
+  $('libModalIn').value = ''; libModalCheck(); $('libModal').style.display = 'flex'; $('libModalIn').focus();
+}
+function libModalCheck() { $('libModalGo').disabled = !libDel || $('libModalIn').value.trim() !== libDel.name; }
+function libModalClose() { $('libModal').style.display = 'none'; libDel = null; }
+async function libDeleteGo() {
+  if (!libDel || $('libModalIn').value.trim() !== libDel.name) return;
+  const id = libDel.id, b = $('libModalGo'); b.disabled = true;
+  try {
+    const r = await api('/api/library/delete', { method: 'POST', body: JSON.stringify({ id, confirm: 'DELETE' }) });
+    libModalClose(); toast(`Deleted, freed ${libSize(r.freed_bytes)}`);
+  } catch (e) { libModalClose(); toast(e.message, true); }
+  loadLibrary(false); loadSystem(false);
+}
+async function libAddProfile(id) {
+  try {
+    const r = await api('/api/library/profile', { method: 'POST', body: JSON.stringify({ id }) });
+    const had = !!draftProf; draftProf = r.profile; sel = draftProf.name;
+    renderTabs(); fillForm(); $('preview').style.display = 'none';
+    location.hash = '#profiles';
+    toast('Draft profile ' + draftProf.name + (had ? ' (replaced the earlier draft)' : '') + ': review and Save' + ((r.notes || []).length ? ' · ' + r.notes[0] : ''));
+  } catch (e) { toast(e.message, true); }
+}
+tabHooks.library = { show() { loadLibrary(false); } };
+
 /* ---- tabs: selected tab lives in location.hash ---- */
-const TABS = ['dashboard', 'chat', 'profiles', 'kev', 'logs', 'system', 'access'];
+const TABS = ['dashboard', 'chat', 'profiles', 'library', 'kev', 'logs', 'system', 'access'];
 function showTab(t) {
   if (!TABS.includes(t)) t = 'dashboard';
   if (t !== curTab && tabHooks[curTab] && tabHooks[curTab].hide) tabHooks[curTab].hide();
