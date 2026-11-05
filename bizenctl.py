@@ -11,6 +11,7 @@ Stdlib only. Run: python3 bizenctl.py --config config.json
 import argparse
 import collections
 import glob
+import hashlib
 import hmac
 import http.client
 import http.server
@@ -22,6 +23,7 @@ import shlex
 import shutil
 import signal
 import socketserver
+import stat
 import subprocess
 import sys
 import tempfile
@@ -887,6 +889,229 @@ def apply_settings(cfg, upd, dry_run=False):
             new["kev"]["hf_home"] = kev_hf
         cfg.save(new, clear_token=bool(upd.get("clear_hf_token")))
     return {"ok": True, "saved": not dry_run, "warnings": warnings, "checks": checks, "settings": public_settings(cfg.data)}
+
+
+# ---------------------------------------------------------------- library (GET /api/library, delete, draft profile)
+
+QUANT_RE = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP4(?:_MOE)?))(?![A-Za-z0-9])", re.I)
+PARTIAL_SUFFIXES = (".part", ".incomplete")
+FIT_OVERHEAD = 0.10      # share of VRAM / RAM assumed lost to KV cache, compute buffers and the OS
+FIT_NOTE = "Rough size-based estimate, not a speed prediction."
+
+
+def parse_quant(name):
+    """Quantisation token from a model base name ('UD-Q3_K_XL', 'Q4_K_M', 'IQ2_XXS', 'BF16', ...), else None."""
+    try:
+        found = QUANT_RE.findall(str(name or ""))
+        return found[-1].upper() if found else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _norm(p):
+    try:
+        return os.path.realpath(os.path.expanduser(str(p)))
+    except (OSError, ValueError):
+        return str(p)
+
+
+def _inside(path, root):
+    """True when the (already resolved) path is root itself or below it."""
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def library_roots(cfg):
+    """[(walk_path, realpath)] for model_dirs + download_dir: existing directories only, deduped by realpath."""
+    out, seen = [], set()
+    dirs = list(cfg.get("model_dirs") or []) + [str(cfg.get("download_dir") or "").strip()]
+    for d in dirs:
+        if not d:
+            continue
+        try:
+            p = os.path.abspath(os.path.expanduser(str(d)))
+            rp = os.path.realpath(p)
+            if rp in seen or not os.path.isdir(rp):
+                continue
+            seen.add(rp)
+            out.append((p, rp))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def fit_verdict(size_bytes, vram_mib, ram_mib):
+    """Plain arithmetic. vram_mib: total over all GPUs (None/0 when unknown); ram_mib: system RAM (or None).
+    fits-vram: weights <= 90% of VRAM; needs-ram: weights <= 90% of VRAM + 90% of RAM; else too-big. None without GPU data."""
+    if not size_bytes or not vram_mib:
+        return {"vram_total_mib": vram_mib or None, "ram_total_mib": ram_mib, "verdict": None,
+                "text": "No GPU data or model size, so no estimate. " + FIT_NOTE}
+    size = size_bytes / 1048576
+    use_v = vram_mib * (1 - FIT_OVERHEAD)
+    use_r = (ram_mib or 0) * (1 - FIT_OVERHEAD)
+    sg = f"{size / 1024:.1f} GiB"
+    if size <= use_v:
+        v, t = "fits-vram", f"{sg} of weights vs {use_v / 1024:.1f} GiB usable VRAM ({vram_mib / 1024:.1f} GiB minus 10%): should fit in VRAM."
+    elif size <= use_v + use_r:
+        v, t = "needs-ram", f"{sg} of weights vs {use_v / 1024:.1f} GiB usable VRAM: the rest ({(size - use_v) / 1024:.1f} GiB) has to sit in system RAM ({use_r / 1024:.1f} GiB usable), so expect CPU offload."
+    else:
+        v, t = "too-big", f"{sg} of weights vs {(use_v + use_r) / 1024:.1f} GiB usable VRAM + RAM combined: too big for this machine."
+    return {"vram_total_mib": vram_mib, "ram_total_mib": ram_mib, "verdict": v, "text": t + " " + FIT_NOTE}
+
+
+def scan_library(cfg, gpu_mems=None, ram_mib=None, loaded_model=None):
+    """Models on disk under model_dirs + download_dir. Never raises; unreadable bits are skipped.
+    cfg: plain config dict; gpu_mems: per-GPU total MiB; loaded_model: model path of the running/starting profile."""
+    gpu_mems = [m for m in (gpu_mems or []) if m]
+    vram = sum(gpu_mems) or None
+    try:
+        roots = library_roots(cfg)
+    except Exception:  # noqa: BLE001
+        roots = []
+    real_roots = [rp for _, rp in roots]
+    seen = set()
+    groups = {}            # (dir, prefix, total) or (path,) -> record
+    mmprojs = {}           # dir -> [path]
+    partials = {}          # (dir, prefix, total) -> {index: path}
+    loose_partials = []    # (dir, path, base)
+
+    def okfile(path):
+        """stat of a regular file whose resolved path stays inside a model root; None otherwise (also for repeats)."""
+        try:
+            rp = os.path.realpath(path)
+            if rp in seen or not any(_inside(rp, r) for r in real_roots):
+                return None
+            st = os.stat(path)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            seen.add(rp)
+            return st
+        except (OSError, ValueError):
+            return None
+
+    for wp, _rp in roots:
+        try:
+            for dp, dns, fns in os.walk(wp, followlinks=False):
+                dns.sort()
+                for fn in sorted(fns):
+                    low = fn.lower()
+                    path = os.path.join(dp, fn)
+                    try:
+                        if low.endswith(PARTIAL_SUFFIXES):
+                            base = fn[:fn.rfind(".")]
+                            if ".gguf" not in low or okfile(path) is None:
+                                continue
+                            sm = SHARD_RE.match(base)
+                            if sm:
+                                partials.setdefault((dp, sm.group(1), sm.group(3)), {})[int(sm.group(2))] = path
+                            else:
+                                loose_partials.append((dp, path, base))
+                            continue
+                        if not low.endswith(".gguf"):
+                            continue
+                        st = okfile(path)
+                        if st is None:
+                            continue
+                        if "mmproj" in low:
+                            mmprojs.setdefault(dp, []).append(path)
+                            continue
+                        sm = SHARD_RE.match(fn)
+                        if sm:
+                            g = groups.setdefault((dp, sm.group(1), sm.group(3)), {
+                                "dir": dp, "prefix": sm.group(1), "tstr": sm.group(3), "total": int(sm.group(3)),
+                                "width": len(sm.group(2)), "shards": {}})
+                            g["shards"][int(sm.group(2))] = (path, st.st_size, st.st_mtime)
+                        else:
+                            groups[(path,)] = {"dir": dp, "prefix": fn[:-5], "tstr": "1", "total": 1, "width": 0,
+                                               "single": path, "shards": {1: (path, st.st_size, st.st_mtime)}}
+                    except Exception:  # noqa: BLE001
+                        continue
+        except Exception:  # noqa: BLE001
+            continue
+
+    profs = []
+    for p in cfg.get("profiles") or []:
+        try:
+            profs.append((p.get("name"), _norm(p.get("model") or "") if p.get("model") else None))
+        except Exception:  # noqa: BLE001
+            pass
+    loaded_n = _norm(loaded_model) if loaded_model else None
+
+    def unfit(why):
+        return {"vram_total_mib": vram, "ram_total_mib": ram_mib, "verdict": None, "text": why + " " + FIT_NOTE}
+
+    models = []
+    for g in groups.values():
+        try:
+            total, sh = g["total"], g["shards"]
+            if g.get("single"):
+                first = g["single"]
+            elif 1 in sh:
+                first = sh[1][0]
+            else:
+                first = os.path.join(g["dir"], f"{g['prefix']}-{1:0{g['width']}d}-of-{g['tstr']}.gguf")
+            found = len(sh)
+            shards = [{"path": sh[i][0], "bytes": sh[i][1]} for i in sorted(sh)]
+            size = sum(s["bytes"] for s in shards)
+            missing = [i for i in range(1, total + 1) if i not in sh]
+            part = partials.get((g["dir"], g["prefix"], g["tstr"]), {})
+            hint = None
+            if missing:
+                still = [i for i in missing if i in part]
+                hint = f"{len(missing)} of {total} shards missing"
+                if still:
+                    hint += " (shard " + ", ".join(map(str, still)) + " is still a partial download)"
+                hint += ": finish the download or delete this set."
+            mm = sorted(mmprojs.get(g["dir"], []), key=lambda p: ("f16" not in os.path.basename(p).lower(), p))
+            names = {_norm(s["path"]) for s in shards}
+            used = [n for n, mp in profs if mp and mp in names]
+            models.append({
+                "id": hashlib.sha1(first.encode("utf-8", "replace")).hexdigest()[:12],
+                "name": g["prefix"], "quant": parse_quant(g["prefix"]), "dir": g["dir"], "first_shard": first,
+                "shards": shards, "shards_found": found, "shards_expected": total, "complete": found == total,
+                "bytes": size, "gib": round(size / 2**30, 2), "mtime": max(s[2] for s in sh.values()),
+                "mmproj": mm[0] if mm else None, "used_by": used, "loaded": bool(loaded_n and loaded_n in names),
+                "partial": False, "hint": hint,
+                "fit": fit_verdict(size, vram, ram_mib) if found == total else unfit("Incomplete set, so no estimate.")})
+        except Exception:  # noqa: BLE001
+            continue
+    for dp, path, base in loose_partials:
+        try:
+            st = os.stat(path)
+            models.append({
+                "id": hashlib.sha1(path.encode("utf-8", "replace")).hexdigest()[:12],
+                "name": base[:-5] if base.lower().endswith(".gguf") else base, "quant": parse_quant(base),
+                "dir": dp, "first_shard": path, "shards": [{"path": path, "bytes": st.st_size}],
+                "shards_found": 0, "shards_expected": 1, "complete": False, "bytes": st.st_size,
+                "gib": round(st.st_size / 2**30, 2), "mtime": st.st_mtime, "mmproj": None, "used_by": [],
+                "loaded": False, "partial": True,
+                "hint": "Partial download (" + os.path.splitext(path)[1] + "): resume it or remove the file by hand.",
+                "fit": unfit("Incomplete download, so no estimate.")})
+        except OSError:
+            pass
+    models.sort(key=lambda m: (-m["mtime"], m["name"]))
+    return {"models": models, "roots": [p for p, _ in roots], "ts": time.time()}
+
+
+def library_scan_now(cfg, sup):
+    """scan_library with live GPU / RAM / loaded-model data from the running controller."""
+    try:
+        gm = [g.get("mem_total") for g in gpu_info(timeout=3)]
+    except Exception:  # noqa: BLE001
+        gm = []
+    try:
+        ram = meminfo().get("total_mib")
+    except Exception:  # noqa: BLE001
+        ram = None
+    lm = None
+    try:
+        if sup.serving():
+            lm = (sup.running_profile or {}).get("model")
+    except Exception:  # noqa: BLE001
+        pass
+    return scan_library(cfg.data, gm, ram, lm)
 
 
 class SSECount:
@@ -1907,6 +2132,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(public_config(cfg.data))
         if path == "/api/system" and method == "GET":
             return self.send_json(system_info(cfg.data))
+        if path == "/api/library" and method == "GET":
+            return self.send_json(library_scan_now(cfg, sup))
         if path == "/api/system/settings" and method == "POST":
             d = self.json_body()
             if not isinstance(d, dict):
