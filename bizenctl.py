@@ -1114,6 +1114,64 @@ def library_scan_now(cfg, sup):
     return scan_library(cfg.data, gm, ram, lm)
 
 
+def library_delete(cfg, sup, entry_id, confirm):
+    """Delete one library entry's own .gguf files. Returns (http_status, body). The target is resolved from a fresh
+    scan by id, never from a client path. Never rmtree: os.remove per file, then os.rmdir of an emptied subfolder."""
+    if confirm != "DELETE":
+        return 400, {"error": 'confirmation missing: send "confirm": "DELETE"'}
+    if not isinstance(entry_id, str) or not entry_id:
+        return 400, {"error": "id is required"}
+    scan = library_scan_now(cfg, sup)
+    models = scan["models"]
+    ent = next((m for m in models if m["id"] == entry_id), None)
+    if ent is None:
+        return 404, {"error": "model not found (rescan the library)"}
+    if ent["partial"]:
+        return 400, {"error": "partial downloads are not deleted here; remove the file by hand"}
+    if ent["loaded"]:
+        return 409, {"error": "model is loaded by the running server; stop it first", "used_by": ent["used_by"]}
+    if ent["used_by"]:
+        return 409, {"error": "model is used by profile(s): " + ", ".join(ent["used_by"]), "used_by": ent["used_by"]}
+    files = [s["path"] for s in ent["shards"]]
+    mm = ent.get("mmproj")
+    if mm:
+        others = [m for m in models if m["id"] != ent["id"] and m["dir"] == ent["dir"]]
+        in_args = any(mm in str(p.get("extra_args") or "") for p in cfg.get("profiles") or [])
+        if not others and not in_args:
+            files.append(mm)
+    roots = [rp for _, rp in library_roots(cfg)]
+    freed, removed, errors = 0, [], []
+    for f in files:
+        try:
+            rp = os.path.realpath(f)
+            if not any(_inside(rp, r) for r in roots):
+                errors.append(f"{f}: outside the model directories")
+                continue
+            n = os.lstat(f).st_size
+            os.remove(f)
+            freed += n
+            removed.append(f)
+        except OSError as e:
+            errors.append(f"{f}: {e.strerror or e}")
+    dir_removed = False
+    try:
+        d = ent["dir"]
+        rd = os.path.realpath(d)
+        if removed and not os.listdir(d) and rd not in roots and any(_inside(rd, r) for r in roots):
+            os.rmdir(d)
+            dir_removed = True
+    except OSError:
+        pass
+    log(f"library: deleted {ent['name']} ({len(removed)} file(s), {freed} bytes) from {ent['dir']}"
+        + (", folder removed" if dir_removed else "") + (f"; {len(errors)} error(s): {errors[0]}" if errors else ""))
+    body = {"ok": not errors, "id": ent["id"], "name": ent["name"], "removed": removed, "freed_bytes": freed,
+            "freed_gib": round(freed / 2**30, 2), "dir_removed": dir_removed, "errors": errors}
+    if errors:
+        body["error"] = f"{len(errors)} file(s) could not be removed: {errors[0]}"
+        return 500, body
+    return 200, body
+
+
 class SSECount:
     """Counts token-bearing `data:` events in a stream that arrives in arbitrary pieces. Observes only;
     what is relayed to the client is never touched. Never raises."""
@@ -2134,6 +2192,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(system_info(cfg.data))
         if path == "/api/library" and method == "GET":
             return self.send_json(library_scan_now(cfg, sup))
+        if path == "/api/library/delete" and method == "POST":
+            d = self.json_body()
+            if not isinstance(d, dict):
+                return self.send_json({"error": "invalid JSON"}, 400)
+            code, body = library_delete(cfg, sup, d.get("id"), d.get("confirm"))
+            return self.send_json(body, code)
         if path == "/api/system/settings" and method == "POST":
             d = self.json_body()
             if not isinstance(d, dict):
