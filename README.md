@@ -26,6 +26,16 @@ lingering so the service survives logout.
 - `systemctl --user status|restart|stop bizen-ctl`
 - `journalctl --user -u bizen-ctl -f` shows controller logs. The llama-server log is in the UI.
 
+## Updating from the portal
+
+The header shows the short commit hash and a chip: `up to date`, `N behind` (as of the last fetch; the page never fetches on a timer), `local changes`, `diverged`, or `not a git checkout`. **Update** opens a dialog that runs a check and then offers **Update now**.
+
+- `GET /api/controller/version` (admin): `{is_git, commit, commit_full, branch, dirty, remote_host, upstream, ahead, behind, last_fetch}`. `remote_host` is the host only; credentials in a remote URL are stripped from everything the controller returns or logs.
+- `POST /api/controller/update` `{"action":"check"}` runs `git fetch --quiet` (60 s limit) and returns `{ok, reason, commits[<=20], files[], restart_needed, model_loaded, would_unload, ahead, behind, ...}`. `restart_needed` is true when `bizenctl.py` or `install.sh` changed; UI/docs/tests-only updates need no restart. `ok:false` carries a readable `reason`: not a git checkout, no upstream, local changes in the tree, diverged / ahead of the upstream, or a failed fetch.
+- `{"action":"apply","confirm":true}` repeats the checks, runs `git pull --ff-only` (90 s limit) and returns `{ok, from, to, restart_needed, restarting}`. Updates are serialized (a second one gets 409). When a restart is needed the response goes out first, then after about 1.5 s the controller shuts down through the normal SIGTERM path (llama-server is stopped, so a loaded model is unloaded and takes minutes to reload) and **systemd `Restart=always` starts it again**; the page polls `/api/status` until it answers and reloads. Without a supervisor the process just stops and you start it by hand. With only UI/docs changes nothing restarts and the page reloads.
+- It never runs `git reset`, `checkout -f`, `clean`, `update.sh` or `systemctl` (a script started inside the service would die with the unit's cgroup). `git` runs with `GIT_TERMINAL_PROMPT=0`, so a remote that needs credentials fails with a short error instead of hanging; the checkout must be able to fetch non-interactively (deploy key or credential helper).
+- `update.sh` still works from a shell and stays the way to update when the portal is down.
+
 ## Profile fields
 
 | field | meaning |

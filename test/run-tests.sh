@@ -90,7 +90,7 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_loadmap test_gen test_placement test_system test_library test_download; do
+for U in test_loadmap test_gen test_placement test_system test_library test_download test_update; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
@@ -137,6 +137,10 @@ ok "clear removes the token" $(! grep -q "$SEC" "$T/config.json" && echo 1 || ec
 ok "model still the same process after all settings saves" $([ "$STATE0" = "$(curl -s -b "$T/jar" $B/api/status | j "print(d['server']['state'],d['server']['pid'])")" ] && echo 1 || echo 0)
 echo "--- library tab: auth, scan, refusals, delete round trip, draft profile"
 ok "library endpoints need login" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B/api/library)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' $B/api/library/delete)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' $B/api/library/profile)" = 401401401 ] && echo 1 || echo 0)
+ok "update endpoints need login" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B/api/controller/version)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"action":"check"}' $B/api/controller/update)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"action":"apply","confirm":true}' $B/api/controller/update)" = 401401401 ] && echo 1 || echo 0)
+curl -s -b "$T/jar" $B/api/controller/version | j "print(int(all(k in d for k in ('is_git','commit','commit_full','branch','dirty','remote_host','upstream','ahead','behind','last_fetch')) and ('@' not in str(d.get('remote_host') or ''))))" | sed 's/^/version shape ok: /'
+ok "version: git checkout with short commit" $(curl -s -b "$T/jar" $B/api/controller/version | j "print(int(d['is_git'] is True and len(d['commit'])==7 and len(d['commit_full'])==40))")
+ok "update: bad action 400, apply without confirm 400" $([ "$(curl -s -b "$T/jar" -o /dev/null -w '%{http_code}' -X POST -d '{"action":"nuke"}' $B/api/controller/update)$(curl -s -b "$T/jar" -o /dev/null -w '%{http_code}' -X POST -d '{"action":"apply"}' $B/api/controller/update)" = 400400 ] && echo 1 || echo 0)
 mkdir -p "$T/second/lib" "$T/dl/x"
 head -c 4096 /dev/zero > "$T/second/lib/Mini-Q4_K_M-00001-of-00002.gguf"; head -c 4096 /dev/zero > "$T/second/lib/Mini-Q4_K_M-00002-of-00002.gguf"
 head -c 2048 /dev/zero > "$T/dl/x/Free-UD-Q3_K_XL.gguf"; echo keep > "$T/second/lib/notes.txt"
