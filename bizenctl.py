@@ -1644,6 +1644,521 @@ def hf_repo_view(cfg, repo):
     return out
 
 
+# ---------------------------------------------------------------- Hugging Face: downloader (/api/downloads)
+
+DL_CHUNK = 1 << 20               # one read1 of up to 1 MiB per loop turn; blocking, never a busy loop
+DL_MAX_QUEUED = 3
+DL_WINDOW_S = 10                 # speed / ETA are averaged over this window
+DL_KEEP = 50                     # finished entries remembered
+DL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+class DlError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code, self.msg = code, msg
+
+
+class DlFail(Exception):
+    """A download that stops with a readable error; the .part files stay."""
+
+
+def _free_bytes(path):
+    try:
+        p = os.path.expanduser(str(path))
+        while p and not os.path.exists(p) and os.path.dirname(p) != p:
+            p = os.path.dirname(p)
+        st = os.statvfs(p)
+        return st.f_bavail * st.f_frsize
+    except (OSError, ValueError):
+        return None
+
+
+def _part_size(final):
+    try:
+        return os.path.getsize(final + ".part") if os.path.isfile(final + ".part") and not os.path.islink(final + ".part") else 0
+    except OSError:
+        return 0
+
+
+def dl_plan(data, repo, paths, sizes):
+    """Validate a download request against the repo's file sizes (sizes: {path: bytes}) and work out where it lands:
+    <download_dir>/<repo name>/<quant folder or 'files'>/<basename>. Returns the plan dict; raises DlError."""
+    if not hf_valid_repo(repo):
+        raise DlError(400, "repo must look like owner/name")
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 64 or not all(isinstance(p, str) for p in paths):
+        raise DlError(400, "files must be a list of 1 to 64 repo paths")
+    paths = list(dict.fromkeys(paths))
+    for p in paths:
+        if not hf_valid_file(p):
+            raise DlError(400, f"bad file name {p[:80]!r}: only plain relative .gguf paths are accepted")
+    mm = [p for p in paths if "mmproj" in p.rpartition("/")[2].lower()]
+    models = [p for p in paths if p not in mm]
+    if len(mm) > 1 or not models:
+        raise DlError(400, "ask for one quant set (all its shards) plus at most one mmproj file")
+    dirs = {p.rpartition("/")[0] for p in models}
+    sets = hf_group_sets([{"path": p, "bytes": 1} for p in models])
+    if len(dirs) != 1 or len(sets) != 1 or not sets[0]["complete"]:
+        raise DlError(400, "files must be exactly one quant set: every shard, all in one folder")
+    if len({p.rpartition("/")[2] for p in paths}) != len(paths):
+        raise DlError(400, "two files have the same name")
+    for p in paths:
+        if not sizes.get(p):
+            raise DlError(404, f"{p} is not a .gguf file in {repo}")
+    root = effective_download_dir(data)
+    if not root:
+        raise DlError(400, "no download directory is configured (set one in System)")
+    base = os.path.realpath(os.path.expanduser(root))
+    folder = next(iter(dirs)).rpartition("/")[2] or "files"
+    dest = os.path.join(base, repo.split("/", 1)[1], folder)
+    if not _inside(os.path.realpath(dest), base):
+        raise DlError(400, "destination would leave the download directory")
+    return {"repo": repo, "name": sets[0]["name"], "base": base, "dest_dir": dest,
+            "files": [{"path": p, "bytes": sizes[p], "done": 0} for p in models + mm]}
+
+
+class Download:
+    def __init__(self, d):
+        self.id, self.repo, self.name = d["id"], d["repo"], d["name"]
+        self.state = d.get("state", "queued")
+        self.files = [{"path": f["path"], "bytes": int(f["bytes"]), "done": int(f.get("done") or 0)} for f in d["files"]]
+        self.dest_dir = d["dest_dir"]
+        self.started, self.finished = d.get("started"), d.get("finished")
+        self.error, self.note = d.get("error"), d.get("note")
+        self.validators = dict(d.get("validators") or {})
+        self.stop = None            # None | "pause" | "cancel"
+        self.conn = None
+        self.samples = collections.deque(maxlen=64)
+        self._t_sample = 0.0
+
+    @property
+    def bytes_total(self):
+        return sum(f["bytes"] for f in self.files)
+
+    @property
+    def bytes_done(self):
+        return sum(min(f["done"], f["bytes"]) for f in self.files)
+
+    def rate(self, now):
+        """Bytes per second over the last DL_WINDOW_S seconds (0 when not running or stalled)."""
+        if self.state != "running":
+            return 0.0
+        pts = [s for s in list(self.samples) if now - s[0] <= DL_WINDOW_S]
+        if len(pts) < 2 or pts[-1][0] - pts[0][0] < 0.4:
+            return 0.0
+        return max(0.0, (pts[-1][1] - pts[0][1]) / (pts[-1][0] - pts[0][0]))
+
+    def public(self, now=None):
+        now = now if now is not None else time.monotonic()
+        done, total, r = self.bytes_done, self.bytes_total, self.rate(now)
+        return {"id": self.id, "repo": self.repo, "name": self.name, "state": self.state,
+                "files": [dict(f) for f in self.files], "bytes_total": total, "bytes_done": done,
+                "pct": round(100.0 * done / total, 1) if total else 0.0,
+                "mbps": round(r / 1e6, 2), "eta_s": int((total - done) / r) if r > 0 and self.state == "running" else None,
+                "started": self.started, "finished": self.finished, "error": self.error, "note": self.note,
+                "dest_dir": self.dest_dir}
+
+    def to_json(self):
+        d = self.public()
+        for k in ("mbps", "eta_s", "pct", "bytes_total", "bytes_done"):
+            d.pop(k, None)
+        d["validators"] = self.validators
+        return d
+
+
+class Downloader:
+    """One worker thread, one active download, FIFO queue of at most DL_MAX_QUEUED. State survives a restart in
+    <config dir>/downloads.json (never the token); interrupted entries come back paused, nothing auto-starts."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.cv = threading.Condition(self.lock)
+        self.items, self.queue, self.cur = [], [], None
+        self._quit = False
+        self._t_save = 0.0
+        self.path = os.path.join(os.path.dirname(os.path.abspath(cfg.path)), "downloads.json")
+        self._load()
+        self.thread = threading.Thread(target=self._worker, daemon=True, name="downloader")
+        self.thread.start()
+
+    # -- persistence
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                raw = json.load(f)
+            rows = raw.get("items") if isinstance(raw, dict) else None
+        except (OSError, ValueError):
+            rows = None
+        for d in rows or []:
+            try:
+                if not (isinstance(d, dict) and DL_ID_RE.match(d["id"]) and hf_valid_repo(d["repo"])
+                        and isinstance(d["dest_dir"], str) and isinstance(d["name"], str)
+                        and all(hf_valid_file(f["path"]) for f in d["files"]) and d["files"]):
+                    continue
+                it = Download(d)
+                if it.state in ("running", "queued"):
+                    it.state, it.note = "paused", "interrupted by a controller restart; resume to continue"
+                elif it.state not in ("paused", "done", "error", "canceled"):
+                    continue
+                if it.state != "done":
+                    for fl in it.files:
+                        fl["done"] = min(fl["bytes"], _part_size(os.path.join(it.dest_dir, os.path.basename(fl["path"]))))
+                self.items.append(it)
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def _save(self, force=True):
+        """Caller holds the lock."""
+        now = time.monotonic()
+        if not force and now - self._t_save < 2.0:
+            return
+        self._t_save = now
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "items": [it.to_json() for it in self.items]}, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log(f"downloads: could not save {self.path}: {e}")
+
+    # -- public api (each returns the entry's public dict or raises DlError)
+    def list(self):
+        with self.lock:
+            now = time.monotonic()
+            return [it.public(now) for it in self.items]
+
+    def active(self):
+        with self.lock:
+            if self.cur is None or self.cur.state != "running":
+                return None
+            p = self.cur.public()
+            return {"id": p["id"], "name": p["name"], "pct": p["pct"], "mbps": p["mbps"], "eta_s": p["eta_s"]}
+
+    def _get(self, did):
+        it = next((x for x in self.items if x.id == did), None)
+        if it is None:
+            raise DlError(404, "no such download")
+        return it
+
+    def add(self, plan):
+        data = self.cfg.data
+        base = plan["base"]
+        du = disk_usage(base)
+        if du["writable"] is False:
+            raise DlError(400, "download directory is not writable")
+        remaining = 0
+        all_done = True
+        for f in plan["files"]:
+            final = os.path.join(plan["dest_dir"], os.path.basename(f["path"]))
+            if os.path.isfile(final) and os.path.getsize(final) == f["bytes"]:
+                f["done"] = f["bytes"]
+                continue
+            all_done = False
+            f["done"] = min(f["bytes"], _part_size(final))
+            remaining += f["bytes"] - f["done"]
+        if all_done:
+            raise DlError(409, "already downloaded")
+        with self.lock:
+            if any(x.repo == plan["repo"] and x.state in ("queued", "running", "paused")
+                   and {f["path"] for f in x.files} == {f["path"] for f in plan["files"]} for x in self.items):
+                raise DlError(409, "this download is already in the list")
+            if len(self.queue) >= DL_MAX_QUEUED:
+                raise DlError(409, f"the queue is full ({DL_MAX_QUEUED} waiting); wait for one to finish or cancel one")
+            others = sum(x.bytes_total - x.bytes_done for x in self.items if x.state in ("queued", "running"))
+            need = remaining + others + float(data.get("min_free_gib_for_download") or 0) * 2**30
+            free = _free_bytes(base)
+            if free is not None and free < need:
+                raise DlError(409, f"not enough free space: need {need / 2**30:.1f} GiB, have {free / 2**30:.1f} GiB")
+            it = Download({"id": secrets.token_hex(4), "repo": plan["repo"], "name": plan["name"], "state": "queued",
+                           "files": plan["files"], "dest_dir": plan["dest_dir"]})
+            self.items.append(it)
+            self.queue.append(it)
+            self._trim()
+            self._save()
+            self.cv.notify_all()
+            return it.public()
+
+    def _trim(self):
+        fin = [x for x in self.items if x.state in ("done", "error", "canceled")]
+        for x in fin[:max(0, len(fin) - DL_KEEP)]:
+            self.items.remove(x)
+
+    def _wait_stopped(self, it, secs=5.0):
+        self.cv.wait_for(lambda: it.state != "running", secs)
+
+    @staticmethod
+    def _abort(it):
+        try:
+            c = it.conn
+            if c is not None and c.sock is not None:
+                c.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def pause(self, did):
+        with self.lock:
+            it = self._get(did)
+            if it.state == "queued":
+                self.queue.remove(it)
+                it.state = "paused"
+            elif it.state == "running":
+                it.stop = "pause"
+                self._abort(it)
+                self._wait_stopped(it)
+            else:
+                raise DlError(409, f"cannot pause a {it.state} download")
+            self._save()
+            return it.public()
+
+    def cancel(self, did):
+        with self.lock:
+            it = self._get(did)
+            if it.state == "running":
+                it.stop = "cancel"
+                self._abort(it)
+                self._wait_stopped(it)
+            elif it.state in ("queued", "paused", "error"):
+                if it in self.queue:
+                    self.queue.remove(it)
+                it.state, it.error, it.note = "canceled", None, None
+            else:
+                raise DlError(409, f"cannot cancel a {it.state} download")
+            self._save()
+            return it.public()
+
+    def resume(self, did):
+        with self.lock:
+            it = self._get(did)
+            if it.state not in ("paused", "error", "canceled"):
+                raise DlError(409, f"cannot resume a {it.state} download")
+            if len(self.queue) >= DL_MAX_QUEUED:
+                raise DlError(409, f"the queue is full ({DL_MAX_QUEUED} waiting)")
+            it.state, it.stop, it.error, it.note = "queued", None, None, None
+            it.finished = None
+            for fl in it.files:
+                fl["done"] = min(fl["bytes"], _part_size(os.path.join(it.dest_dir, os.path.basename(fl["path"]))))
+            self.queue.append(it)
+            self._save()
+            self.cv.notify_all()
+            return it.public()
+
+    def remove(self, did, delete_partial=False):
+        with self.lock:
+            it = self._get(did)
+            if it.state not in ("done", "error", "canceled"):
+                raise DlError(409, f"cancel the {it.state} download first")
+            removed = 0
+            if delete_partial:
+                removed = self._delete_parts(it)
+            self.items.remove(it)
+            self._save()
+            return {"ok": True, "removed_partial": removed}
+
+    def _delete_parts(self, it):
+        """Remove this download's .part files. Confined to the download directory, regular files only."""
+        base = os.path.realpath(os.path.expanduser(effective_download_dir(self.cfg.data) or "/nonexistent"))
+        d = os.path.realpath(it.dest_dir)
+        if d == base or not _inside(d, base):
+            return 0
+        n = 0
+        for f in it.files:
+            part = os.path.join(d, os.path.basename(f["path"]) + ".part")
+            try:
+                if os.path.isfile(part) and not os.path.islink(part) and _inside(os.path.realpath(part), base):
+                    os.remove(part)
+                    n += 1
+            except OSError:
+                pass
+        for dirp in (d, os.path.dirname(d)):
+            try:
+                if dirp != base and _inside(dirp, base):
+                    os.rmdir(dirp)          # only succeeds when empty
+            except OSError:
+                break
+        return n
+
+    def shutdown(self):
+        with self.lock:
+            self._quit = True
+            it = self.cur
+            if it is not None and it.state == "running":
+                it.stop = "pause"
+                self._abort(it)
+                self._wait_stopped(it, 3.0)
+            for x in self.items:
+                if x.state in ("running", "queued"):
+                    x.state, x.note = "paused", "interrupted by a controller restart; resume to continue"
+            self._save()
+            self.cv.notify_all()
+
+    # -- worker
+    def _worker(self):
+        while True:
+            with self.lock:
+                while not self._quit and not self.queue:
+                    self.cv.wait(30)
+                if self._quit:
+                    return
+                it = self.queue.pop(0)
+                it.state, it.stop, it.error, it.note = "running", None, None, None
+                if it.started is None:
+                    it.started = time.time()
+                it.samples.clear()
+                it.samples.append((time.monotonic(), it.bytes_done))
+                self.cur = it
+                self._save()
+            try:
+                self._run(it)
+            except Exception as e:  # noqa: BLE001
+                with self.lock:
+                    it.state, it.error = "error", f"unexpected error ({e.__class__.__name__}: {e})"[:300]
+            with self.lock:
+                it.conn = None
+                self.cur = None
+                if it.state in ("done", "error", "canceled"):
+                    it.finished = time.time()
+                self._save()
+                self.cv.notify_all()
+
+    def _finish(self, it, state, error=None):
+        with self.lock:
+            it.state, it.error = state, error
+            self.cv.notify_all()
+
+    def _run(self, it):
+        data = self.cfg.data
+        endpoint = str(data.get("hf_endpoint") or DEFAULTS["hf_endpoint"]).rstrip("/")
+        try:
+            base = os.path.realpath(os.path.expanduser(effective_download_dir(data) or "/nonexistent"))
+            if not _inside(os.path.realpath(it.dest_dir), base):
+                raise DlFail("destination is outside the download directory (was download_dir changed?)")
+            os.makedirs(it.dest_dir, exist_ok=True)
+            if not _inside(os.path.realpath(it.dest_dir), base):
+                raise DlFail("destination is outside the download directory")
+            for f in it.files:
+                if it.stop:
+                    break
+                self._fetch_file(it, f, base, endpoint)
+        except DlFail as e:
+            if it.stop is None:
+                return self._finish(it, "error", str(e)[:400])
+        except OSError as e:
+            if it.stop is None:
+                return self._finish(it, "error", f"disk error: {e.strerror or e}"[:300])
+        self._finish(it, {"pause": "paused", "cancel": "canceled"}.get(it.stop, "done" if not it.stop else "paused"))
+
+    def _tick(self, it):
+        now = time.monotonic()
+        if now - it._t_sample >= 0.5:
+            it._t_sample = now
+            it.samples.append((now, it.bytes_done))
+            with self.lock:
+                self._save(force=False)
+
+    def _fetch_file(self, it, f, base, endpoint):
+        name = os.path.basename(f["path"])
+        final = os.path.join(it.dest_dir, name)
+        part = final + ".part"
+        if os.path.islink(final) or os.path.islink(part):
+            raise DlFail(f"refusing to write through a symlink: {name}")
+        if os.path.isfile(final) and os.path.getsize(final) == f["bytes"]:
+            f["done"] = f["bytes"]
+            return
+        existing = _part_size(final)
+        if existing > f["bytes"]:
+            existing = 0
+        url = f"{endpoint}/{urllib.parse.quote(it.repo, safe='/')}/resolve/main/{urllib.parse.quote(f['path'], safe='/')}"
+        host = urllib.parse.urlsplit(endpoint).netloc
+
+        def set_conn(c):
+            it.conn = c
+            if it.stop:
+                raise DlFail("stopped")
+
+        for _ in range(3):
+            token = str(self.cfg.data.get("hf_token") or "")
+            hdr = {}
+            if existing > 0:
+                hdr["Range"] = f"bytes={existing}-"
+                if it.validators.get(f["path"]):
+                    hdr["If-Range"] = it.validators[f["path"]]
+            conn = None
+            try:
+                conn, resp, _u = hf_request(url, token, endpoint, hdr, on_conn=set_conn)
+                st = resp.status
+                complete = False
+                if st == 416 and existing:
+                    if existing == f["bytes"]:
+                        complete = True
+                    else:
+                        existing = 0
+                        continue
+                elif st not in (200, 206):
+                    err = hf_status_error(st, bool(token))
+                    if st in (401, 403):
+                        raise DlFail("access denied: accept the model's terms on Hugging Face and set a token in System"
+                                     + ("; token rejected" if token else ""))
+                    raise DlFail("file not found on Hugging Face" if st == 404 else err.msg)
+                if not complete:
+                    if st == 206:
+                        m = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)", resp.getheader("Content-Range") or "")
+                        if not m or int(m.group(1)) != existing:
+                            existing = 0
+                            continue
+                        if m.group(3) != "*" and int(m.group(3)) != f["bytes"]:
+                            raise DlFail(f"{name}: size changed on the server (expected {f['bytes']}, now {m.group(3)}); remove the entry and its partial file")
+                        mode = "ab"
+                    else:
+                        existing, mode = 0, "wb"      # 200: the server ignored Range or the file changed: start over
+                        cl = resp.getheader("Content-Length")
+                        if cl and cl.isdigit() and int(cl) != f["bytes"]:
+                            raise DlFail(f"{name}: server reports {cl} bytes, expected {f['bytes']}")
+                    et = resp.getheader("ETag")
+                    if et and not et.startswith("W/"):
+                        it.validators[f["path"]] = et
+                    f["done"] = existing
+                    try:
+                        fh = open(part, mode)
+                    except OSError as e:
+                        raise DlFail(f"disk error opening {name}.part: {e.strerror or e}") from None
+                    with fh:
+                        while True:
+                            chunk = resp.read1(DL_CHUNK)
+                            if not chunk:
+                                break
+                            if f["done"] + len(chunk) > f["bytes"]:
+                                raise DlFail(f"{name}: server sent more than the expected {f['bytes']} bytes")
+                            try:
+                                fh.write(chunk)
+                            except OSError as e:
+                                raise DlFail(f"disk error writing {name}.part: {e.strerror or e}") from None
+                            f["done"] += len(chunk)
+                            self._tick(it)
+                            if it.stop:
+                                return
+                break
+            except DlFail:
+                raise
+            except (OSError, http.client.HTTPException, HFError) as e:
+                if it.stop:
+                    return
+                if isinstance(e, http.client.IncompleteRead):
+                    raise DlFail(f"{name}: connection closed before the end of the file; resume to continue") from None
+                raise DlFail(hf_net_error(e, host).msg) from None
+            finally:
+                if conn is not None:
+                    conn.close()
+        else:
+            raise DlFail(f"{name}: the server kept changing its answer; try again")
+        size = os.path.getsize(part) if os.path.isfile(part) else 0
+        if size != f["bytes"]:
+            raise DlFail(f"{name}: size mismatch, got {size} bytes but the repo lists {f['bytes']}; partial file kept, resume to retry")
+        os.replace(part, final)
+        f["done"] = f["bytes"]
+
+
 class SSECount:
     """Counts token-bearing `data:` events in a stream that arrives in arbitrary pieces. Observes only;
     what is relayed to the client is never touched. Never raises."""
@@ -2527,6 +3042,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def sup(self):
         return self.server.sup
 
+    @property
+    def dl(self):
+        return self.server.dl
+
     # -- helpers
     def send_json(self, obj, code=200):
         body = json.dumps(obj).encode()
@@ -2640,6 +3159,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "unit": unit_status(),
                 "kev": self.server.kev.status(),
                 "router_enabled": self.server.router.enabled(),
+                "downloads_active": self.dl.active(),
             })
         if path == "/api/loadmap" and method == "GET":
             lm = parse_startup_log(list(sup.logs))
@@ -2686,6 +3206,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 return self.send_json(hf_repo_view(cfg.data, repo))
             except HFError as e:
+                return self.send_json({"error": e.msg}, e.code)
+        if path == "/api/downloads" and method == "GET":
+            return self.send_json(self.dl.list())
+        if path == "/api/downloads" and method == "POST":
+            d = self.json_body()
+            if not isinstance(d, dict):
+                return self.send_json({"error": "invalid JSON"}, 400)
+            repo = str(d.get("repo") or "")
+            try:
+                if not hf_valid_repo(repo):
+                    raise DlError(400, "repo must look like owner/name")
+                sizes = {f["path"]: f["bytes"] for f in hf_repo_raw(cfg.data, repo)["files"]}
+                return self.send_json({"ok": True, "download": self.dl.add(dl_plan(cfg.data, repo, d.get("files"), sizes))})
+            except HFError as e:
+                return self.send_json({"error": e.msg}, e.code)
+            except DlError as e:
+                return self.send_json({"error": e.msg}, e.code)
+        mm = re.fullmatch(r"/api/downloads/([0-9a-f]{8})/(cancel|pause|resume|remove)", path)
+        if mm and method == "POST":
+            d = self.json_body()
+            if not isinstance(d, dict):
+                return self.send_json({"error": "invalid JSON"}, 400)
+            try:
+                if mm.group(2) == "remove":
+                    return self.send_json(self.dl.remove(mm.group(1), d.get("delete_partial") is True))
+                return self.send_json({"ok": True, "download": getattr(self.dl, mm.group(2))(mm.group(1))})
+            except DlError as e:
                 return self.send_json({"error": e.msg}, e.code)
         if path == "/api/library/profile" and method == "POST":
             d = self.json_body()
@@ -3030,6 +3577,7 @@ def main():
     router = Router(cfg, kev)
     srv = Server((cfg.get("listen_host"), cfg.get("listen_port")), Handler)
     srv.cfg, srv.sup, srv.kev, srv.router = cfg, sup, kev, router
+    srv.dl = Downloader(cfg)
     srv.sampler = Sampler(sup)
     srv.sampler.start()
 
@@ -3037,6 +3585,7 @@ def main():
         log("shutting down")
         sup.stop("controller exit")
         kev.stop("controller exit")
+        srv.dl.shutdown()
         os._exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
