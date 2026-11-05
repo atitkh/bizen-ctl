@@ -171,7 +171,8 @@
       <div><b id="kUp">–</b><span>uptime · load time</span></div>
       <div><b id="kUnload">–</b><span>idle unload in</span></div>
       <div><b id="kGen">–</b><span>generation</span></div>
-      <div><b id="kRam">–</b><span>RAM used / total</span></div>
+      <div><b id="kRam">–</b><span>RAM used / total (container)</span></div>
+      <div id="kHostFreeBox" style="display:none"><b id="kHostFree">–</b><span>host free</span></div>
       <div><b id="kCpu">–</b><span>pinned cores (auto)</span></div>
       <div id="kDl" style="display:none;cursor:pointer" onclick="location.hash='#library/downloads'" title="Open the Downloads view"><b id="kDlV">–</b><span id="kDlL">downloading</span></div>
     </div>
@@ -204,6 +205,7 @@
   <section>
     <h2>RAM <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="ramNote"></span></h2>
     <div id="ramBars"></div>
+    <div class="note" id="ramViewNote" style="margin:6px 0 0">"this container" is what this container sees; "host (all users)" bars are the whole machine's NUMA nodes, shared with everyone else on it.</div>
     <div class="legend"><span><i style="background:var(--acc)"></i>used</span><span><i style="background:#3d5f8f"></i>cache</span><span><i style="background:#232a35"></i>free</span></div>
     <div class="note" style="margin:10px 0 2px">RAM used, last 10 min <span id="ramSparkNote"></span></div>
     <div id="ramSpark"></div>
@@ -855,15 +857,24 @@ function renderRam() {
   if (m.total_mib) {
     const used = m.used_mib != null ? m.used_mib : m.total_mib - (m.available_mib || 0);
     const cache = Math.max(0, (m.available_mib || 0) - (m.free_mib || 0));
-    rows.push(`<div class="nodebar"><span>total</span>${stackBar([{ v: used, c: 'var(--acc)', t: 'used ' + gib(used) + ' GiB' }, { v: cache, c: '#3d5f8f', t: 'cache ' + gib(cache) + ' GiB' }], m.total_mib)}<span>${gib(used)} used / ${gib(m.total_mib)} GiB</span></div>`);
+    rows.push(`<div class="nodebar"><span title="This container's own view (/proc/meminfo as lxcfs reports it)">this container</span>${stackBar([{ v: used, c: 'var(--acc)', t: 'used ' + gib(used) + ' GiB' }, { v: cache, c: '#3d5f8f', t: 'cache ' + gib(cache) + ' GiB' }], m.total_mib)}<span>${gib(used)} used / ${gib(m.total_mib)} GiB</span></div>`);
     $('kRam').textContent = gib(used) + ' / ' + gib(m.total_mib) + ' GiB';
     $('kRam').title = `available ${gib(m.available_mib)} GiB (counts reclaimable cache)\ncached ${gib(m.cached_mib)} GiB, free ${gib(m.free_mib)} GiB` + (m.cgroup ? `\ncgroup ${gib(m.cgroup.used_mib)} GiB` + (m.cgroup.limit_mib ? ' / ' + gib(m.cgroup.limit_mib) : '') : '');
   }
   for (const n of m.nodes || []) {
     const cache = Math.min(n.cached_mib || 0, n.used_mib), app = n.used_mib - cache;
-    rows.push(`<div class="nodebar"><span>node ${n.node}</span>${stackBar([{ v: app, c: 'var(--acc)', t: 'used ' + gib(app) + ' GiB' }, { v: cache, c: '#3d5f8f', t: 'cache ' + gib(cache) + ' GiB' }], n.total_mib)}<span>${gib(app)} + ${gib(cache)} cache / ${gib(n.total_mib)} GiB</span></div>`);
+    rows.push(`<div class="nodebar"><span title="Host-wide NUMA node memory (/sys/devices/system/node), counts every user on the machine">host (all users) · node ${n.node}</span>${stackBar([{ v: app, c: 'var(--acc)', t: 'used ' + gib(app) + ' GiB' }, { v: cache, c: '#3d5f8f', t: 'cache ' + gib(cache) + ' GiB' }], n.total_mib)}<span>${gib(app)} + ${gib(cache)} cache / ${gib(n.total_mib)} GiB</span></div>`);
   }
   $('ramBars').innerHTML = rows.join('') || '<div class="note">no memory info</div>';
+  // host free = free + reclaimable file cache, summed over NUMA nodes (host-wide); hidden without node data
+  const hf = m.host_free_mib;
+  $('kHostFreeBox').style.display = hf != null ? '' : 'none';
+  if (hf != null) {
+    $('kHostFree').textContent = gib(hf) + ' GiB';
+    $('kHostFreeBox').title = 'Host-wide: free memory plus reclaimable file cache, summed over all NUMA nodes (every user on the machine).\n' +
+      'The RAM figure next to it is this container only (lxcfs view), so the two are not comparable.';
+  }
+  $('ramViewNote').style.display = (m.nodes || []).length ? '' : 'none';
   const mx = m.total_mib || 1, win = mbuf.slice(-600);
   $('ramSpark').innerHTML = spark(win, [{ v: x => x.ram_used, color: 'var(--acc)', fill: true }, { v: x => x.rss, color: 'var(--ok)' }], 600, mx, 56);
   $('ramSparkNote').textContent = '(blue = used, green = llama-server RSS)';

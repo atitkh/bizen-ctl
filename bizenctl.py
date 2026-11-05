@@ -390,8 +390,9 @@ def numa_meminfo():
             tot, free = m.get("MemTotal"), m.get("MemFree")
             if tot is None or free is None:
                 continue
+            cached = m.get("FilePages", 0)
             nodes.append({"node": idx, "total_mib": tot, "free_mib": free, "used_mib": tot - free,
-                          "cached_mib": m.get("FilePages", 0)})
+                          "cached_mib": cached, "avail_mib": free + min(cached, tot - free)})
         except Exception:  # noqa: BLE001 - metrics must never raise
             continue
     return nodes
@@ -546,6 +547,8 @@ def meminfo(pid=None):
         out["cgroup"] = cgroup_mem()
     except Exception:  # noqa: BLE001
         pass
+    # host-wide reclaimable memory: sum over NUMA nodes of free + file cache (None without node data)
+    out["host_free_mib"] = sum(n["avail_mib"] for n in out["nodes"]) if out["nodes"] else None
     return out
 
 
