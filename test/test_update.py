@@ -100,6 +100,13 @@ check("apply ui-only: ok, restart_needed False, restarting False", code == 200 a
 code, body = u3.apply(True)
 check("apply when already up to date: ok no-op", code == 200 and body["ok"] and body["from"] == body["to"])
 
+# untracked runtime files (downloads.json next to config.json) must not count as local changes
+box_u = fresh_box("untracked")
+open(os.path.join(box_u, "downloads.json"), "w").write("{}\n")
+uu = upd(box_u)
+check("untracked file is not 'dirty'", uu.info()["dirty"] is False)
+check("check ok with an untracked runtime file", uu.check()["ok"] or "local changes" not in (uu.check().get("reason") or ""))
+
 # 6 refusals
 box3 = fresh_box("dirty")
 commit(dev, "ui.html", "u4\n", "ui 4"); git(dev, "push", "-q")

@@ -3101,7 +3101,7 @@ class Updater:
             out["commit_full"], out["commit"] = full, full[:7]
         rc, br, _ = self.git("rev-parse", "--abbrev-ref", "HEAD")
         out["branch"] = br if rc == 0 else None
-        rc, st, _ = self.git("status", "--porcelain")
+        rc, st, _ = self.git("status", "--porcelain", "--untracked-files=no")   # runtime files (downloads.json) must not block updates
         out["dirty"] = bool(st) if rc == 0 else None
         rc, up, _ = self.git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
         out["upstream"] = up if rc == 0 and up else None
