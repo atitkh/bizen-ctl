@@ -1095,12 +1095,17 @@ def scan_library(cfg, gpu_mems=None, ram_mib=None, loaded_model=None):
     return {"models": models, "roots": [p for p, _ in roots], "ts": time.time()}
 
 
+def live_gpu_mems():
+    """Total MiB of each detected GPU ([] without nvidia-smi). Never raises."""
+    try:
+        return [g.get("mem_total") for g in gpu_info(timeout=3) if g.get("mem_total")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def library_scan_now(cfg, sup):
     """scan_library with live GPU / RAM / loaded-model data from the running controller."""
-    try:
-        gm = [g.get("mem_total") for g in gpu_info(timeout=3)]
-    except Exception:  # noqa: BLE001
-        gm = []
+    gm = live_gpu_mems()
     try:
         ram = meminfo().get("total_mib")
     except Exception:  # noqa: BLE001
@@ -1170,6 +1175,67 @@ def library_delete(cfg, sup, entry_id, confirm):
         body["error"] = f"{len(errors)} file(s) could not be removed: {errors[0]}"
         return 500, body
     return 200, body
+
+
+def choose_gpus(size_bytes, gpu_mems):
+    """'auto:N' for a model of this size: every GPU when it needs more than half the total VRAM, else 1 (it fits
+    one card with ~10% overhead) or 2. Without GPU data or a size, the profile default."""
+    gm = [m for m in (gpu_mems or []) if m]
+    if not gm or not size_bytes:
+        return PROFILE_DEFAULTS["gpus"]
+    size = size_bytes / 1048576
+    if size > sum(gm) / 2:
+        return f"auto:{len(gm)}"
+    if size <= max(gm) * (1 - FIT_OVERHEAD):
+        return "auto:1"
+    return f"auto:{min(2, len(gm))}"
+
+
+def unique_profile_name(base, taken):
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", str(base or "")).strip("-.")[:48] or "model"
+    name, i = base, 2
+    while name in taken:
+        name, i = f"{base}-{i}", i + 1
+    return name
+
+
+def library_draft(cfg, sup, d):
+    """Draft profile (not saved) for a library entry. Returns (http_status, body)."""
+    ent = next((m for m in library_scan_now(cfg, sup)["models"] if m["id"] == d.get("id")), None)
+    if ent is None:
+        return 404, {"error": "model not found (rescan the library)"}
+    if not ent["complete"] or ent["partial"]:
+        return 409, {"error": "model is incomplete (" + (ent["hint"] or "partial download") + ")"}
+    gpus = d.get("gpus")
+    gm = live_gpu_mems()
+    if gpus in (None, ""):
+        gpus = choose_gpus(ent["bytes"], gm)
+    else:
+        gpus = str(gpus).strip()
+        if not (re.fullmatch(r"auto:\d+", gpus) or re.fullmatch(r"\d+(,\d+)*", gpus) or gpus == "none"):
+            return 400, {"error": "gpus must be auto:N, a list like 0,1, or none"}
+    ctx = d.get("ctx")
+    if ctx in (None, ""):
+        ctx = PROFILE_DEFAULTS["ctx"]
+    else:
+        try:
+            ctx = int(ctx)
+            if not 256 <= ctx <= 16777216:
+                raise ValueError
+        except (TypeError, ValueError):
+            return 400, {"error": "ctx must be an integer between 256 and 16777216"}
+    want = d.get("name")
+    if want not in (None, "") and not re.fullmatch(r"[A-Za-z0-9._-]+", str(want)):
+        return 400, {"error": "name must be [A-Za-z0-9._-]"}
+    taken = {p["name"] for p in cfg.get("profiles") or []}
+    name = unique_profile_name(want or ent["name"], taken)
+    prof = dict(PROFILE_DEFAULTS, name=name, model=ent["first_shard"], gpus=gpus, ctx=ctx, fit=True)
+    notes = []
+    if want and name != want:
+        notes.append(f"name {want!r} is taken, using {name!r}")
+    if ent["mmproj"]:
+        notes.append(f"vision projector found: add --mmproj {ent['mmproj']} to extra args if you want image input")
+    return 200, {"draft": True, "profile": prof, "fit": ent["fit"], "notes": notes}
 
 
 class SSECount:
@@ -2192,6 +2258,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(system_info(cfg.data))
         if path == "/api/library" and method == "GET":
             return self.send_json(library_scan_now(cfg, sup))
+        if path == "/api/library/profile" and method == "POST":
+            d = self.json_body()
+            if not isinstance(d, dict):
+                return self.send_json({"error": "invalid JSON"}, 400)
+            code, body = library_draft(cfg, sup, d)
+            return self.send_json(body, code)
         if path == "/api/library/delete" and method == "POST":
             d = self.json_body()
             if not isinstance(d, dict):
