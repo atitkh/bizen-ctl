@@ -293,6 +293,10 @@
     <div class="grid2">
       <div><label>Unload after idle (minutes, 0 = never)</label><input id="ttl" type="number" min="0"></div>
       <div style="display:flex;align-items:end"><label class="check"><input id="keep" type="checkbox"> Keep loaded (ignore idle unload)</label></div>
+      <div><label>Wait for a busy model (seconds)</label><input id="swait" type="number" min="0" max="1800" step="1">
+        <span class="note">A request naming another profile waits this long for running requests to finish, then gets 503 busy.</span></div>
+      <div style="display:flex;align-items:start"><label class="check"><input id="strict" type="checkbox"> Reject unknown model names (404)</label>
+        <span class="note" style="margin-left:8px">Off = an unknown name is served like <code>auto</code>.</span></div>
       <div class="full"><label>Client endpoint</label>
         <pre class="cmd" id="endpoint"></pre></div>
     </div>
@@ -440,6 +444,12 @@
   <section>
     <h2>Endpoints</h2>
     <pre class="cmd" id="rtEndpoints"></pre>
+    <label style="margin-top:12px">Model names</label>
+    <div class="note" style="text-transform:none;letter-spacing:0;line-height:1.5">
+      A profile name loads and serves that profile. <code>auto</code> (or no model) serves whatever is active
+      (the router picks when it is on). An unknown name gets 404 (unless relaxed in Behaviour).
+      Switching waits for running requests to finish, then answers 503 busy with Retry-After.</div>
+    <pre class="cmd" id="modelNames" style="margin-top:6px"></pre>
   </section>
 
   </div>
@@ -475,10 +485,22 @@ async function loadConfig() {
   cfg = await api('/api/config');
   if (!sel || (!(draftProf && draftProf.name === sel) && !cfg.profiles.find(p => p.name === sel))) sel = cfg.active_profile;
   $('ttl').value = cfg.idle_ttl_min; $('keep').checked = cfg.keep_loaded;
+  $('swait').value = cfg.switch_wait_s ?? 120; $('strict').checked = cfg.strict_model_names !== false;
   $('keys').value = cfg.api_keys.join('\n');
   const host = location.hostname, port = location.port || 80;
   $('endpoint').textContent = `base_url: ${location.protocol}//${host}:${port}/v1\napi_key:  ${cfg.api_keys[0] || '(none)'}\nmodel:    ${cfg.active_profile}`;
   renderTabs(); fillForm(); loadRouter();
+}
+
+/* ---- model names (live list from /v1/models) ---- */
+async function loadModelNames(key) {
+  const el = $('modelNames');
+  let ids = cfg.profiles.map(p => p.name).concat([cfg.router.alias]), live = false;
+  try {
+    const r = await fetch('/v1/models', { headers: { Authorization: 'Bearer ' + key } });
+    if (r.ok) { ids = ((await r.json()).data || []).map(m => m.id); live = true; }
+  } catch (e) { /* keep the config-derived list */ }
+  el.textContent = ids.join('\n') + (live ? '' : '\n(from the saved config; /v1/models not reachable)');
 }
 
 /* ---- router ---- */
@@ -509,7 +531,9 @@ curl ${base}/v1/route \\
   -d '{"prompt":"your prompt"}'
 
 # Response headers on routed requests: X-Bizen-Route, X-Bizen-Route-P,
-# X-Bizen-Route-Fallback (why the default was used), X-Bizen-Route-Served (busy: kept the loaded one)`;
+# X-Bizen-Route-Fallback (why the default was used), X-Bizen-Route-Served (busy: kept the loaded one)
+# Every proxied response: X-Bizen-Profile (the profile that served it)`;
+  loadModelNames(key);
 }
 function renderRoutes() {
   const names = cfg.profiles.map(p => p.name);
@@ -704,6 +728,9 @@ async function preview() {
 }
 async function saveBehaviour() {
   const c = structuredClone(cfg); c.idle_ttl_min = Number($('ttl').value) || 0; c.keep_loaded = $('keep').checked;
+  const sw = Number($('swait').value);
+  if (!Number.isInteger(sw) || sw < 0 || sw > 1800) return toast('Wait must be a whole number of seconds, 0 to 1800', true);
+  c.switch_wait_s = sw; c.strict_model_names = $('strict').checked;
   try { await putConfig(c); } catch (e) { toast(e.message, true); }
 }
 function addKey() {
