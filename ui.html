@@ -71,6 +71,18 @@
   .lib td .sub { font-size: 11.5px; color: var(--dim); word-break: break-all; }
   .lib td.act { white-space: nowrap; text-align: right; } .lib td.act button { margin-left: 6px; }
   .lib .chips { margin-top: 3px; }
+  .subnav { grid-column: 1 / -1; display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: -4px; }
+  .subnav a { padding: 7px 16px; color: var(--dim); text-decoration: none; border-bottom: 2px solid transparent; font-size: 13px; }
+  .subnav a:hover { color: var(--text); } .subnav a.sel { color: var(--text); border-bottom-color: var(--acc); }
+  .hfgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-top: 12px; }
+  .hfcard { background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px; cursor: pointer; min-width: 0; }
+  .hfcard:hover, .hfcard.sel { border-color: var(--acc); }
+  .hfcard b { display: block; word-break: break-all; font-weight: 600; } .hfcard .sub { font-size: 11.5px; color: var(--dim); margin-top: 3px; }
+  .dlcard { background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; display: grid; gap: 7px; }
+  .dlcard .bar i { background: var(--acc); transition: width .6s linear; } .dlcard.s-paused .bar i, .dlcard.s-canceled .bar i { background: var(--dim); }
+  .dlcard.s-error .bar i { background: var(--bad); } .dlcard.s-done .bar i { background: var(--ok); }
+  .dlcard .err { color: var(--bad); font-size: 12.5px; word-break: break-word; } .dlcard .sub { font-size: 11.5px; color: var(--dim); word-break: break-all; }
+  pre.card { white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; font-size: 12px; background: #0f1319; border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
   .empty { padding: 26px 10px; text-align: center; color: var(--dim); }
   #libModal { position: fixed; inset: 0; background: rgba(8,10,14,.7); display: none; align-items: center; justify-content: center; z-index: 6; }
   #libModal .box { width: 420px; max-width: 92vw; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 10px; }
@@ -161,6 +173,7 @@
       <div><b id="kGen">–</b><span>generation</span></div>
       <div><b id="kRam">–</b><span>RAM used / total</span></div>
       <div><b id="kCpu">–</b><span>pinned cores (auto)</span></div>
+      <div id="kDl" style="display:none;cursor:pointer" onclick="location.hash='#library/downloads'" title="Open the Downloads view"><b id="kDlV">–</b><span id="kDlL">downloading</span></div>
     </div>
   </section>
 
@@ -277,10 +290,35 @@
 
   </div>
   <div class="pane" id="pane-library" data-tab="library">
-  <section class="wide">
+  <div class="subnav" id="libSubnav">
+    <a href="#library" data-sub="installed">Installed</a><a href="#library/browse" data-sub="browse">Browse</a><a href="#library/downloads" data-sub="downloads">Downloads <span id="libDlDot" class="note"></span></a>
+  </div>
+  <section class="wide" id="libSecInstalled">
     <h2>Library <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="libAge"></span><button id="libRefresh" onclick="loadLibrary(true)">Refresh</button></h2>
     <div class="chips" id="libHead" style="margin-bottom:10px"></div>
     <div id="libList"></div>
+  </section>
+  <section class="wide" id="libSecBrowse" style="display:none">
+    <h2>Browse Hugging Face (GGUF models)</h2>
+    <div class="row">
+      <input id="hfQ" placeholder="search, e.g. qwen 30b instruct" style="flex:1;min-width:200px;width:auto" onkeydown="if(event.key==='Enter')hfSearch()">
+      <select id="hfSort" style="width:auto" onchange="hfSearch()"><option value="downloads">most downloads</option><option value="likes">most likes</option><option value="lastModified">recently updated</option></select>
+      <button class="primary" id="hfGo" onclick="hfSearch()">Search</button>
+    </div>
+    <div class="note" id="hfTokenNote" style="margin-top:6px"></div>
+    <div class="note" id="hfMsg" style="margin-top:6px"></div>
+    <div class="hfgrid" id="hfResults"></div>
+  </section>
+  <section class="wide" id="libSecDetail" style="display:none">
+    <h2><span id="hfTitle">Model</span><span class="sp"></span><button onclick="hfClose()">Close</button></h2>
+    <div class="chips" id="hfChips" style="margin-bottom:10px"></div>
+    <div class="note" id="hfDetailMsg"></div>
+    <div id="hfSets"></div>
+    <details id="hfCardBox" style="margin-top:12px"><summary>Model card</summary><pre class="card" id="hfCard"></pre></details>
+  </section>
+  <section class="wide" id="libSecDownloads" style="display:none">
+    <h2>Downloads <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="dlDisk"></span></h2>
+    <div id="dlList"></div>
   </section>
   </div>
   <div id="libModal"><div class="box">
@@ -703,6 +741,10 @@ async function refresh() {
   $('kUnload').textContent = status.keep_loaded ? 'never' : (s.unload_in_s != null ? fmtDur(s.unload_in_s) : (s.inflight ? 'busy' : '–'));
   $('kCpu').textContent = status.auto_pin.length + (status.auto_pin_node != null ? ` (node ${status.auto_pin_node})` : '');
   $('kCpu').title = 'auto: ' + status.auto_pin.join(',') + '\nallowed: ' + status.cpus_allowed.join(',') + (status.numactl ? '' : '\nnumactl missing: using taskset, no memory binding');
+  const da = status.downloads_active;
+  $('kDl').style.display = da ? '' : 'none';
+  if (da) { $('kDlV').textContent = Math.round(da.pct) + '% · ' + da.mbps + ' MB/s'; $('kDlL').textContent = 'downloading ' + da.name + (da.eta_s != null ? ' · ' + fmtDur(da.eta_s) : ''); }
+  $('libDlDot').textContent = da ? '● ' + Math.round(da.pct) + '%' : '';
   $('unit').textContent = status.unit || 'not under systemd';
   const kv = status.kev;
   $('kevState').className = 'pill s-' + (kv.state === 'external' ? 'running' : kv.state);
@@ -1202,6 +1244,192 @@ async function sysClearToken() {
 ['sDl', 'sHf', 'sLs', 'sEp', 'sMin', 'sTok'].forEach(i => $(i).addEventListener('input', () => { sysFormDirty = true; }));
 tabHooks.system = { show() { if (!sysLoaded) loadSystem(false); } };
 
+/* ---- Library sub-views: Browse (GET /api/hf/search, /api/hf/repo) and Downloads (/api/downloads). Text from the network
+   (model names, tags, the model card) only ever goes through textContent, never innerHTML. ---- */
+let libSub = 'installed', hfRes = null, hfRepo = null, hfBusy = false, dlItems = [], dlBusy = false, dlTimer = null;
+const dlEls = {};
+const hfN = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n || 0);
+const hfBytes = b => b >= 2 ** 30 ? (b / 2 ** 30).toFixed(2) + ' GiB' : (b / 2 ** 20).toFixed(0) + ' MiB';
+const hfDate = s => { const d = s ? new Date(s) : null; return d && !isNaN(d) ? d.toLocaleDateString() : '–'; };
+function mk(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function libSubShow() {
+  const sec = { installed: 'libSecInstalled', browse: 'libSecBrowse', downloads: 'libSecDownloads' };
+  for (const k in sec) $(sec[k]).style.display = k === libSub ? '' : 'none';
+  $('libSecDetail').style.display = libSub === 'browse' && hfRepo ? '' : 'none';
+  document.querySelectorAll('#libSubnav a').forEach(a => a.classList.toggle('sel', a.dataset.sub === libSub));
+  if (libSub === 'installed') loadLibrary(false);
+  else if (libSub === 'browse') hfShow();
+  else dlLoad();
+  if (!dlTimer) dlTimer = setInterval(() => { if (!document.hidden && curTab === 'library' && libSub === 'downloads') dlLoad(); }, 1000);
+}
+async function hfShow() {
+  if (!sysInfo) { try { sysInfo = await api('/api/system'); } catch (e) { /* the note below just stays generic */ } }
+  const has = sysInfo && sysInfo.settings && sysInfo.settings.has_hf_token;
+  $('hfTokenNote').innerHTML = has ? 'A Hugging Face token is set, so gated models you have access to will open.'
+    : 'No Hugging Face token is set: public models only. Gated models need a token under <a href="#system" style="color:var(--acc)">System</a>.';
+  if (!hfRes && !hfBusy) hfSearch();
+}
+async function hfSearch() {
+  if (hfBusy) return; hfBusy = true;
+  $('hfGo').disabled = true; $('hfMsg').style.color = ''; $('hfMsg').textContent = 'Searching…';
+  try {
+    hfRes = await api('/api/hf/search?q=' + encodeURIComponent($('hfQ').value.trim()) + '&sort=' + encodeURIComponent($('hfSort').value) + '&limit=20');
+    hfRender();
+  } catch (e) {
+    if (e.message !== 'login') { hfRes = null; $('hfResults').innerHTML = ''; $('hfMsg').style.color = 'var(--bad)'; $('hfMsg').textContent = e.message; }
+  } finally { hfBusy = false; $('hfGo').disabled = false; }
+}
+function hfRender() {
+  const rs = (hfRes && hfRes.results) || [], box = $('hfResults');
+  $('hfMsg').style.color = '';
+  $('hfMsg').textContent = rs.length ? rs.length + ' result' + (rs.length === 1 ? '' : 's') + (hfRes.cached ? ' (cached, under a minute old)' : '') : 'No GGUF models found for that search.';
+  box.innerHTML = '';
+  rs.forEach(m => {
+    const c = mk('div', 'hfcard' + (hfRepo && hfRepo.id === m.id ? ' sel' : ''));
+    c.appendChild(mk('b', '', m.id));
+    c.appendChild(mk('div', 'sub', '↓ ' + hfN(m.downloads) + ' · ♥ ' + hfN(m.likes) + ' · updated ' + hfDate(m.last_modified)));
+    if (m.gated || m.private) {
+      const ch = mk('div', 'chips'); ch.style.marginTop = '5px';
+      if (m.gated) ch.appendChild(mk('span', 'chip warn', 'gated'));
+      if (m.private) ch.appendChild(mk('span', 'chip warn', 'private'));
+      c.appendChild(ch);
+    }
+    c.onclick = () => hfOpen(m.id);
+    box.appendChild(c);
+  });
+}
+function hfClose() { hfRepo = null; $('libSecDetail').style.display = 'none'; hfRender(); }
+async function hfOpen(id) {
+  hfRepo = { id, loading: true };
+  $('libSecDetail').style.display = '';
+  $('hfTitle').textContent = id; $('hfChips').innerHTML = ''; $('hfSets').innerHTML = ''; $('hfCard').textContent = '';
+  $('hfCardBox').style.display = 'none';
+  $('hfDetailMsg').style.color = ''; $('hfDetailMsg').textContent = 'Loading the file list…';
+  hfRender();
+  try {
+    const r = await api('/api/hf/repo?id=' + encodeURIComponent(id));
+    if (!hfRepo || hfRepo.id !== id) return;
+    hfRepo = r; hfRenderRepo();
+  } catch (e) {
+    if (e.message !== 'login' && hfRepo && hfRepo.id === id) { $('hfDetailMsg').style.color = 'var(--bad)'; $('hfDetailMsg').textContent = e.message; }
+  }
+}
+function hfRenderRepo() {
+  const r = hfRepo, chips = $('hfChips'), host = $('hfSets');
+  chips.innerHTML = ''; host.innerHTML = '';
+  chips.appendChild(mk('span', 'chip done', '↓ ' + hfN(r.downloads) + ' · ♥ ' + hfN(r.likes)));
+  if (r.license) chips.appendChild(mk('span', 'chip done', 'license: ' + r.license));
+  (r.base_model || []).forEach(b => chips.appendChild(mk('span', 'chip done', 'base: ' + b)));
+  if (r.architecture) chips.appendChild(mk('span', 'chip', 'arch: ' + r.architecture));
+  if (r.gated) chips.appendChild(mk('span', 'chip warn', 'gated'));
+  const sets = r.sets || [];
+  $('hfDetailMsg').style.color = '';
+  $('hfDetailMsg').textContent = sets.length ? 'Pick a quant. Files land in the download directory and show up under Installed when done.'
+    : 'No .gguf files in this repo.' + (r.tree_truncated ? ' (file list was cut off)' : '');
+  if (sets.length) {
+    const t = mk('table', 'lib'), hd = mk('tr');
+    ['Quant set', 'Quant', 'Size', 'Shards', 'Fit', ''].forEach(h => hd.appendChild(mk('th', '', h)));
+    const th = mk('thead'); th.appendChild(hd); t.appendChild(th);
+    const tb = mk('tbody');
+    sets.forEach((s, i) => {
+      const tr = mk('tr'), c1 = mk('td'), nm = mk('b', '', s.name);
+      c1.appendChild(nm);
+      if (s.mmproj) { const mc = mk('span', 'chip', '+ mmproj'); mc.style.marginLeft = '6px'; mc.title = s.mmproj.path + ' (' + hfBytes(s.mmproj.bytes) + ') is downloaded with it'; c1.appendChild(mc); }
+      if (s.already_downloaded) { const dc = mk('span', 'chip ok', 'already downloaded'); dc.style.marginLeft = '6px'; c1.appendChild(dc); }
+      if (!s.complete) c1.appendChild(mk('div', 'sub', 'Incomplete in the repo: ' + s.shards + ' of ' + s.shards_expected + ' shards listed.'));
+      tr.appendChild(c1);
+      const c2 = mk('td'); c2.appendChild(s.quant ? mk('span', 'chip done', s.quant) : mk('span', 'note', '–')); tr.appendChild(c2);
+      tr.appendChild(mk('td', '', hfBytes(s.bytes)));
+      tr.appendChild(mk('td', '', s.complete ? String(s.shards) : s.shards + '/' + s.shards_expected));
+      const c5 = mk('td'), fv = s.fit && LIB_FIT[s.fit.verdict];
+      const fc = mk('span', 'chip ' + (fv ? fv[1] : ''), fv ? fv[0] : '?'); fc.title = s.fit ? s.fit.text : ''; c5.appendChild(fc); tr.appendChild(c5);
+      const c6 = mk('td', 'act'), b = mk('button', 'primary', 'Download');
+      b.disabled = !s.complete || !!s.already_downloaded;
+      b.title = !s.complete ? 'Some shards are missing in the repo' : s.already_downloaded ? 'Already in the library' : 'Download ' + s.files.length + ' file' + (s.files.length === 1 ? '' : 's');
+      b.onclick = () => hfDownload(i, b);
+      c6.appendChild(b); tr.appendChild(c6); tb.appendChild(tr);
+    });
+    t.appendChild(tb); host.appendChild(t);
+  }
+  $('hfCardBox').style.display = r.card ? '' : 'none';
+  $('hfCard').textContent = (r.card || '') + (r.card_truncated ? '\n\n[model card cut off after 20000 characters]' : '');
+}
+async function hfDownload(i, btn) {
+  const s = hfRepo && hfRepo.sets && hfRepo.sets[i]; if (!s) return;
+  const files = s.files.map(f => f.path); if (s.mmproj) files.push(s.mmproj.path);
+  btn.disabled = true;
+  try {
+    await api('/api/downloads', { method: 'POST', body: JSON.stringify({ repo: hfRepo.id, files }) });
+    toast('Queued ' + s.name); location.hash = '#library/downloads';
+  } catch (e) { if (e.message !== 'login') toast(e.message, true); }
+  finally { btn.disabled = false; }
+}
+async function dlLoad() {
+  if (dlBusy) return; dlBusy = true;
+  try { dlItems = await api('/api/downloads'); dlRender(); }
+  catch (e) { if (e.message !== 'login') $('dlDisk').textContent = 'unavailable: ' + e.message; }
+  finally { dlBusy = false; }
+}
+async function dlAct(id, action, body) {
+  try { await api('/api/downloads/' + id + '/' + action, { method: 'POST', body: JSON.stringify(body || {}) }); }
+  catch (e) { if (e.message !== 'login') toast(e.message, true); }
+  dlLoad();
+}
+async function dlAddProfile(d) {
+  try {
+    const lib = await api('/api/library'); libData = lib;
+    const norm = p => String(p).replace(/\/+$/, '');
+    const ms = (lib.models || []).filter(x => x.name === d.name && x.complete);
+    const m = ms.find(x => norm(x.dir) === norm(d.dest_dir)) || ms[0];
+    if (!m) { toast('Not in the library scan yet: open Installed and refresh', true); return; }
+    await libAddProfile(m.id);
+  } catch (e) { if (e.message !== 'login') toast(e.message, true); }
+}
+function dlButtons(d) {
+  const out = [], B = (label, fn, cls) => { const b = mk('button', cls || '', label); b.onclick = fn; out.push(b); };
+  const st = d.state;
+  if (st === 'running' || st === 'queued') B('Pause', () => dlAct(d.id, 'pause'));
+  if (st === 'paused' || st === 'error' || st === 'canceled') B(st === 'error' ? 'Retry' : 'Resume', () => dlAct(d.id, 'resume'), 'primary');
+  if (st === 'running' || st === 'queued' || st === 'paused') B('Cancel', () => dlAct(d.id, 'cancel'), 'danger');
+  if (st === 'done') B('Add as profile', () => dlAddProfile(d), 'primary');
+  if (st === 'done' || st === 'error' || st === 'canceled') B('Remove', () => dlAct(d.id, 'remove'));
+  if (st === 'error' || st === 'canceled') B('Remove + delete partial files', () => { if (confirm('Delete the partial files of ' + d.name + '?')) dlAct(d.id, 'remove', { delete_partial: true }); }, 'danger');
+  return out;
+}
+function dlBuild(d) {
+  const el = mk('div', 'dlcard s-' + d.state), head = mk('div', 'row');
+  head.appendChild(mk('b', '', d.name));
+  const chip = mk('span', 'chip ' + (d.state === 'error' ? 'bad' : d.state === 'done' ? 'ok' : d.state === 'running' ? 'done' : ''), d.state === 'running' ? 'downloading' : d.state);
+  head.appendChild(chip);
+  const sp = mk('span'); sp.style.flex = '1'; head.appendChild(sp);
+  dlButtons(d).forEach(b => head.appendChild(b));
+  el.appendChild(head);
+  const bar = mk('div', 'bar'), fill = mk('i'); bar.appendChild(fill); el.appendChild(bar);
+  const num = mk('div', 'note'), err = mk('div', 'err'), sub = mk('div', 'sub', d.repo + ' → ' + d.dest_dir);
+  el.appendChild(num); el.appendChild(err); el.appendChild(sub);
+  return { el, state: d.state, fill, num, err };
+}
+function dlRender() {
+  const box = $('dlList'), ids = new Set(dlItems.map(d => d.id));
+  const dl = ((sysInfo && sysInfo.disks) || []).find(x => x.role === 'download');
+  $('dlDisk').textContent = dl && dl.free_gib != null ? dl.free_gib + ' GiB free in ' + dl.path : '';
+  for (const id in dlEls) if (!ids.has(id)) { dlEls[id].el.remove(); delete dlEls[id]; }
+  if (!dlItems.length) { box.innerHTML = '<div class="empty">No downloads yet.<br><span class="note">Open Browse, pick a model and a quant.</span></div>'; box._empty = true; return; }
+  if (box._empty) { box.innerHTML = ''; box._empty = false; }
+  for (const d of dlItems) {
+    let c = dlEls[d.id];
+    if (!c || c.state !== d.state) {
+      const n = dlBuild(d);
+      if (c) box.replaceChild(n.el, c.el); else box.appendChild(n.el);
+      c = dlEls[d.id] = n;
+    }
+    c.fill.style.width = (d.pct || 0) + '%';
+    c.num.textContent = hfBytes(d.bytes_done) + ' / ' + hfBytes(d.bytes_total) + ' · ' + (d.pct || 0).toFixed(1) + '% · ' + d.files.length + ' file' + (d.files.length === 1 ? '' : 's') +
+      (d.state === 'running' ? ' · ' + d.mbps.toFixed(1) + ' MB/s · ETA ' + fmtDur(d.eta_s) : d.state === 'queued' ? ' · waiting' : '');
+    c.err.textContent = d.error || d.note || '';
+  }
+}
+
 /* ---- Library tab: models on disk (GET /api/library, POST /api/library/delete, POST /api/library/profile) ---- */
 let libData = null, libBusy = false, libDel = null;
 const libSize = b => b >= 2 ** 30 ? (b / 2 ** 30).toFixed(1) + ' GiB' : (b / 2 ** 20).toFixed(0) + ' MiB';
@@ -1270,12 +1498,15 @@ async function libAddProfile(id) {
     toast('Draft profile ' + draftProf.name + (had ? ' (replaced the earlier draft)' : '') + ': review and Save' + ((r.notes || []).length ? ' · ' + r.notes[0] : ''));
   } catch (e) { toast(e.message, true); }
 }
-tabHooks.library = { show() { loadLibrary(false); } };
+tabHooks.library = { show() { libSubShow(); } };
 
 /* ---- tabs: selected tab lives in location.hash ---- */
 const TABS = ['dashboard', 'chat', 'profiles', 'library', 'kev', 'logs', 'system', 'access'];
-function showTab(t) {
+function showTab(h) {
+  const parts = String(h || '').split('/');
+  let t = parts[0];
   if (!TABS.includes(t)) t = 'dashboard';
+  if (t === 'library') libSub = ['installed', 'browse', 'downloads'].includes(parts[1]) ? parts[1] : 'installed';
   if (t !== curTab && tabHooks[curTab] && tabHooks[curTab].hide) tabHooks[curTab].hide();
   curTab = t;
   document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.dataset.tab === t));
