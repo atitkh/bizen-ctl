@@ -92,6 +92,9 @@ DEFAULTS = {
     "admin_password": "",
     "llama_server": "~/llama.cpp/build/bin/llama-server",
     "model_dirs": ["/srv/fs/models"],
+    "gpu_bucket_mib": 512,          # auto:N ranks GPUs by used VRAM in buckets of this size (ties go to the highest index)
+    "gpu_fallback_count": 8,        # GPU indices assumed for auto:N when nvidia-smi is unavailable
+    "download_mbps": 11.7,          # only used for the "about N min" download estimate in the Kev hint
     "internal_port": 18081,
     "idle_ttl_min": 10,
     "keep_loaded": False,
@@ -128,15 +131,15 @@ KEV_PRESETS = [
     {"id": "jaredpalmer/kev-0.8b", "base": "Qwen3.5-0.8B-Base", "weights_gib": 1.5, "approx": False,
      "note": "default; the size tested here in fp32"},
     {"id": "jaredpalmer/kev-4b", "base": "Qwen3.5-4B-Base", "weights_gib": 8.4, "approx": False,
-     "note": "better decisions; fits an 11 GB card only in fp16 with CUDA graphs off (fp32 is about 17 GB, graph buffers add about 2 GB)"},
+     "note": "better decisions; weights are about 8.4 GiB in fp16 (fp32 about 17 GiB) and CUDA-graph buffers add about 2 GB"},
     {"id": "jaredpalmer/kev-0.6b", "base": "Qwen3-0.6B-Base", "weights_gib": 1.2, "approx": True,
      "note": "smallest current checkpoint"},
     {"id": "jaredpalmer/kev-8b", "base": "Qwen3-8B", "weights_gib": 16.4, "approx": True,
-     "note": "needs a 24 GB card in fp16"},
+     "note": "about 16 GiB of weights in fp16"},
     {"id": "jaredpalmer/kev-9b", "base": "Qwen3.5-9B-Base", "weights_gib": 19.3, "approx": False,
-     "note": "needs a 24 GB card in fp16"},
+     "note": "about 19 GiB of weights in fp16"},
     {"id": "jaredpalmer/kev-27b", "base": "Qwen3.8-27B", "weights_gib": 51.3, "approx": False,
-     "note": "bf16 only, 80 GB-class GPU; not usable on 2080 Ti"},
+     "note": "bf16 only, about 51 GiB of weights: needs an 80 GB-class GPU"},
     {"id": "jaredpalmer/kev-0.5b", "base": "Qwen2.5-0.5B", "weights_gib": 1.0, "approx": True,
      "note": "legacy prototype"},
 ]
@@ -208,6 +211,13 @@ class Config:
                 raise ValueError(f"profile {p['name']}: gpus must be auto:N, a list like 0,1, or none")
             shlex.split(p.get("extra_args") or "")
         r, k = d["router"], d["kev"]
+        for key, lo in (("gpu_bucket_mib", 1), ("gpu_fallback_count", 1), ("download_mbps", 0.01)):
+            try:
+                ok = float(d[key]) >= lo
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                raise ValueError(f"{key} must be a number >= {lo}")
         if not re.fullmatch(r"[A-Za-z0-9._-]+", str(r["alias"])) or r["alias"] in names:
             raise ValueError("router alias must be [A-Za-z0-9._-] and not a profile name")
         if not 0 <= float(r["threshold"]) <= 1:
@@ -293,13 +303,13 @@ def auto_pin():
     return cpus, node_of.get(cpus[0])
 
 
-def gpu_info():
+def gpu_info(timeout=10):
     if not shutil.which("nvidia-smi"):
         return []
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu",
-             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10).stdout
+             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=timeout).stdout
     except (subprocess.SubprocessError, OSError):
         return []
     gpus = []
@@ -313,7 +323,7 @@ def gpu_info():
     return gpus
 
 
-def pick_gpus(spec, own=(), exclude=()):
+def pick_gpus(spec, own=(), exclude=(), bucket=512, fallback=8):
     """Resolve a gpus spec. For auto:N, GPUs we already hold count as free and `exclude` is skipped."""
     spec = str(spec).strip()
     if spec in ("", "none"):
@@ -324,10 +334,11 @@ def pick_gpus(spec, own=(), exclude=()):
     n = int(m.group(1))
     gpus = [g for g in gpu_info() if g["index"] not in exclude]
     if not gpus:
-        return [i for i in range(8) if i not in exclude][-n:]
-    # Least-used first in 512 MiB buckets; ties go to the highest index, since
+        return [i for i in range(fallback) if i not in exclude][-n:]
+    # Least-used first in `bucket` MiB steps (512 by default); ties go to the highest index, since
     # other users' jobs default to GPU 0 and up.
-    ranked = sorted(gpus, key=lambda g: (0 if g["index"] in own else (g["mem_used"] or 0) // 512, -g["index"]))
+    bucket = max(1, int(bucket or 512))
+    ranked = sorted(gpus, key=lambda g: (0 if g["index"] in own else (g["mem_used"] or 0) // bucket, -g["index"]))
     return sorted(g["index"] for g in ranked[:n])
 
 
@@ -776,7 +787,8 @@ class Supervisor:
     def build(self, prof):
         exe = os.path.expanduser(prof.get("llama_server") or self.cfg.get("llama_server"))
         kev_gpus = self.kev.gpus if self.kev else []
-        gpus = pick_gpus(prof["gpus"], own=self.running_gpus if self.proc else (), exclude=kev_gpus)
+        gpus = pick_gpus(prof["gpus"], own=self.running_gpus if self.proc else (), exclude=kev_gpus,
+                         bucket=self.cfg.get("gpu_bucket_mib") or 512, fallback=self.cfg.get("gpu_fallback_count") or 8)
         env = dict(os.environ)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # make CUDA indices match nvidia-smi
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus)) if gpus else ""
@@ -1066,7 +1078,8 @@ class KevService:
             uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
             cmd = [uv, "run", "--frozen", "--extra", "serve", "python", "-m", "kev.serve",
                    "--run", k["model"], "--port", str(k["port"])]
-        gpus = pick_gpus(k["gpus"], own=self.gpus if self.proc else (), exclude=self.llama.running_gpus)
+        gpus = pick_gpus(k["gpus"], own=self.gpus if self.proc else (), exclude=self.llama.running_gpus,
+                         bucket=self.cfg.get("gpu_bucket_mib") or 512, fallback=self.cfg.get("gpu_fallback_count") or 8)
         env = dict(os.environ)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))

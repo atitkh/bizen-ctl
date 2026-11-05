@@ -1,6 +1,6 @@
 # bizen-ctl
 
-One-port controller for llama-server on the shared Bizon box. Python stdlib only.
+One-port controller for llama-server on a shared GPU box (written on a Bizon workstation, any Linux box works). Python stdlib only.
 
 - `http://host:8080/v1/...`: OpenAI-compatible API, needs `Authorization: Bearer <key>`.
   The first request loads the active profile (about 1 min from the NAS). After `idle_ttl_min`
@@ -8,7 +8,7 @@ One-port controller for llama-server on the shared Bizon box. Python stdlib only
 - `http://host:8080/`: web UI (admin password). Edit and switch profiles, start/stop/restart,
   per-GPU VRAM, live log, tok/s, test prompt, API keys.
 
-## Install (on bizon, as your user)
+## Install (on the GPU box, as your user)
 
 ```
 tar xzf bizen-ctl.tgz -C ~ && cd ~/bizen-ctl
@@ -66,7 +66,7 @@ below the field says whether weights plus working memory fit on one card. Kev lo
 - CUDA graphs: Kev replays its passes as CUDA graphs by default, which needs a state buffer of about 2 GB
   on kev-4b and kev-9b. On an 11 GB card kev-4b (8.4 GiB fp16 weights) only fits with "CUDA graphs: off"
   (`KEV_CUDA_GRAPHS=0`); the picker sets that for you. Requests are slower with graphs off.
-- Turing (2080 Ti) has no bf16, so use fp32, or fp16 for models that need it (kev-4b). fp16 was not
+- On the original box (Turing, 2080 Ti) there is no bf16, so use fp32, or fp16 for models that need it (kev-4b). fp16 was not
   compared with fp32 here, so check a few answers.
 
 Rules: the loaded profile is only replaced when no other request is in flight; a switch costs a model

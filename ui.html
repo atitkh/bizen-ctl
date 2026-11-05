@@ -347,7 +347,7 @@
 <div id="toast"></div>
 
 <script>
-let cfg = null, sel = null, status = null;
+let cfg = null, sel = null, status = null, sysInfo = null;
 let curTab = 'dashboard';
 const tabHooks = {};   // tab name -> {show(), hide()}
 const $ = id => document.getElementById(id);
@@ -443,9 +443,29 @@ function kevPick() {
   else {
     inp.value = v; inp.style.display = 'none';
     const p = kevPresets.find(x => x.id === v), g = document.querySelector('[data-kev="cuda_graphs"]');
-    if (p && p.weights_gib >= 4 && g.value === 'auto') g.value = 'off';      // big Kevs do not fit an 11 GB card with graph buffers
+    if (p && p.weights_gib >= 4 && g.value === 'auto') g.value = 'off';      // big Kevs rarely fit a small card with graph buffers
   }
   kevHint();
+}
+// VRAM (MiB) and compute capability of the GPU Kev will use: the one it runs on, else the explicit kev.gpus list,
+// else the smallest card llama-server is not using. Unknown (no nvidia-smi) -> null, and the hint skips the fit check.
+function kevCard() {
+  const gl = (status && status.gpus) || [], caps = (sysInfo && sysInfo.gpus) || [];
+  const kg = (status && status.kev && status.kev.gpus) || [];
+  let idx = kg.length ? kg : [];
+  if (!idx.length) {
+    const spec = String(((cfg && cfg.kev) || {}).gpus || '').trim();
+    if (/^\d+(,\d+)*$/.test(spec)) idx = spec.split(',').map(Number);
+  }
+  if (!idx.length) {
+    const used = new Set(((status && status.server && status.server.gpus) || []));
+    idx = gl.map(g => g.index).filter(i => !used.has(i));
+  }
+  const cs = gl.filter(g => idx.includes(g.index) && g.mem_total);
+  if (!cs.length) return null;
+  const small = cs.reduce((a, g) => g.mem_total < a.mem_total ? g : a);
+  const cap = (caps.find(x => x.index === small.index) || {}).compute_cap;
+  return { mib: small.mem_total, name: small.name, cap: cap ? parseFloat(cap) : null };
 }
 function kevHint() {
   const el = $('kevHint'); if (!el) return;
@@ -457,16 +477,21 @@ function kevHint() {
   const w = p.weights_gib * (dtype === 'fp32' ? 2 : 1);
   const bank = (graphs !== 'off' && p.weights_gib >= 4) ? 2.0 : 0;           // Kev's CUDA-graph state buffers, ~2 GB at 4B and 9B
   const need = w + 1.5 + bank;                                               // weights + working set (+ graph buffers)
-  const cards = ((status && status.gpus) || []).map(g => g.mem_total).filter(Boolean);
-  const card = (cards.length ? Math.min(...cards) : 11264) / 1024;
-  const dl = p.weights_gib * 1.0, mins = Math.max(1, Math.round(dl * 1024 / 11.7 / 60));
-  const fits = need <= card - 0.5;
-  let t = `${p.base} · weights ≈ ${w.toFixed(1)} GiB in ${dtype}${p.approx ? ' (estimate)' : ''}, about ${need.toFixed(1)} GiB with working memory${bank ? ' and CUDA-graph buffers' : ''}, on a ${card.toFixed(0)} GiB card. `;
-  if (fits) t += 'Fits.';
-  else if (bank && w + 1.5 <= card - 0.5) t += 'Does NOT fit with CUDA graphs on: set CUDA graphs to off.';
-  else t += 'Will NOT fit on one GPU' + (dtype === 'fp32' && p.weights_gib <= card - 2 ? ': try fp16 (Turing has no bf16).' : '.');
+  const cd = kevCard(), card = cd ? cd.mib / 1024 : null;
+  const mbps = Number((cfg && cfg.download_mbps) || 11.7);
+  const dl = p.weights_gib * 1.0, mins = Math.max(1, Math.round(dl * 1024 / mbps / 60));
+  let fits = true;
+  let t = `${p.base} · weights ≈ ${w.toFixed(1)} GiB in ${dtype}${p.approx ? ' (estimate)' : ''}, about ${need.toFixed(1)} GiB with working memory${bank ? ' and CUDA-graph buffers' : ''}`;
+  if (card == null) t += '. GPU size unknown (no nvidia-smi data), so no fit check. ';
+  else {
+    fits = need <= card - 0.5;
+    t += `, on a ${card.toFixed(0)} GiB card${cd.name ? ' (' + cd.name + ')' : ''}. `;
+    if (fits) t += 'Fits.';
+    else if (bank && w + 1.5 <= card - 0.5) t += 'Does NOT fit with CUDA graphs on: set CUDA graphs to off.';
+    else t += 'Will NOT fit on one GPU' + (dtype === 'fp32' && p.weights_gib <= card - 2 ? ': try fp16' + (cd.cap != null && cd.cap < 8 ? ` (compute ${cd.cap.toFixed(1)} has no bf16).` : '.') : '.');
+  }
   if (dtype === 'fp16') t += ' fp16 has not been checked against fp32 here; compare a few answers.';
-  t += ` First start downloads the base model (≈ ${p.weights_gib} GiB, about ${mins} min at 11.7 MB/s); ${p.note}.`;
+  t += ` First start downloads the base model (≈ ${p.weights_gib} GiB, about ${mins} min at ${mbps} MB/s); ${p.note}.`;
   el.textContent = t; el.style.color = fits ? '' : 'var(--bad)';
 }
 async function saveRouter(restartKev) {
