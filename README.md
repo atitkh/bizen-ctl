@@ -79,7 +79,7 @@ The page at `/` is a tabbed dashboard; the selected tab is kept in the URL hash 
 
 - **Dashboard**: KPIs, per-GPU cards (memory bar plus a 5-minute util/memory sparkline; blue = this server's GPUs), a RAM panel (stacked used / cache / free bars for the container and for each NUMA node, 10-minute sparkline, llama-server RSS and bytes read from disk), a CPU grid (one cell per core, pinned cores outlined) and the generation state. Charts are inline SVG fed by `/api/metrics`.
 - **Chat**: streaming chat against the running profile (system prompt, max tokens, temperature, time-to-first-token and live tok/s, Stop, Clear). A cold model shows a "loading, first start can take minutes" banner.
-- **Profiles**: profile editor and Behaviour. **Kev**: router settings and router test. **Logs**: llama-server log. **System**: detected hardware and portable settings (see below). **Access**: API keys, admin password, endpoints.
+- **Profiles**: profile editor and Behaviour. **Library**: models on disk (see below). **Kev**: router settings and router test. **Logs**: llama-server log. **System**: detected hardware and portable settings (see below). **Access**: API keys, admin password, endpoints.
 
 RAM note: "available" counts reclaimable page cache, and an mmap'd model *is* page cache, so it barely moves while a model loads or runs. The KPI therefore shows used (total - available) / total, and the RAM panel splits used from cache, per NUMA node (read from `/sys/devices/system/node`, which is host-wide even inside LXD, unlike lxcfs's `/proc/meminfo`).
 
@@ -96,6 +96,18 @@ RAM note: "available" counts reclaimable page cache, and an mmap'd model *is* pa
 - `GET /api/status` gained `server.load` = `{phase, bytes_read, bytes_total, pct, eta_s, mbps}` (shard-aware model size; `bytes_read` from the child's `/proc/<pid>/io` `rchar`, which is what `--load-mode none` does, with an RSS-growth fallback for mmap; `pct` is monotonic and capped at 99 until ready) and `server.gen` = `{active, tokens, ttft_s, tps, last_tps}`. Both are also on every `/api/metrics` sample.
 - `GET /api/loadmap` (login required): `{profile, state, layers_total, layers_offloaded, devices:[{name, weights_mib, kv_mib, compute_mib}], cpu_mib, per_layer:[{layer, device}], fit:{raw:[...]}}` parsed from the startup log. Every pattern is optional, so a build that prints less just gives fewer fields. `test/fixtures/startup-q3.log` is a SYNTHETIC illustration of llama.cpp's format, not a real log; replace it with a real startup log when you have one.
 - Not verified on the real box: llama.cpp's actual log wording for this build, `rchar` behaviour on the NAS mount, browser rendering.
+
+## Library tab
+
+Models already on disk, for tidying up and for creating profiles without typing paths. Open `#library`.
+
+- Scans every `model_dirs` entry and `download_dir` (deduped, recursive, read-only until you delete something). Multi-shard sets (`-0000N-of-0000M.gguf`) are one row; `mmproj` files are not rows, they attach to the models in the same folder. Symlinks that resolve outside the model directories are ignored. Partial downloads (`.part`, `.incomplete`) and sets with a missing shard show an amber shard count (`2/3`) and a hint instead of being hidden.
+- Columns: name and folder, quant chip (`UD-Q3_K_XL`, `Q4_K_M`, `IQ2_XXS`, `BF16`... parsed from the file name, blank when none), size, shards, **used by** (profiles whose model is the first shard or any shard), a **loaded** badge, and a fit chip. The header shows model count, total size and free space on the download directory (amber below `min_free_gib_for_download`).
+- **Fit** is plain arithmetic on file size: it fits VRAM when the weights are at most 90% of the summed VRAM of all GPUs, needs RAM when they fit in 90% of VRAM + 90% of system RAM, otherwise too big. No GPU data means no verdict. The tooltip repeats that this is a rough size-based estimate, not a speed prediction.
+- **Delete**: asks you to type the model name, then calls `POST /api/library/delete` with `{"id", "confirm": "DELETE"}`. The id is resolved from a fresh scan (a client path is never accepted). Refused with 409 while a profile uses the model or it is loaded, 400 without the confirm token or for partial downloads. It `os.remove`s only that set's own `.gguf` shards, plus its `mmproj` when no other model shares the folder and no profile names it in `extra_args`; never `rmtree`, other files in the folder stay. The folder is removed only if it is then empty and is a strict subdirectory of a model directory. One line per delete goes to the controller log.
+- **Add as profile**: `POST /api/library/profile` with `{id, name?, gpus?, ctx?}` returns a draft (nothing is saved): `PROFILE_DEFAULTS` with `model` = first shard, a unique `[A-Za-z0-9._-]` name from the model name, `gpus` `auto:N` (all GPUs when the model needs more than half of the total VRAM, else 1 or 2), `fit` true. The UI opens it as a dashed "unsaved" tab in the Profiles editor; **Save** goes through the normal save path, **Delete** discards it.
+- `GET /api/library` (login required) returns `{models:[{id, name, quant, dir, first_shard, shards:[{path,bytes}], shards_found, shards_expected, complete, bytes, gib, mtime, mmproj, used_by, loaded, partial, hint, fit:{vram_total_mib, ram_total_mib, verdict, text}}], roots, ts}`, newest first. `GET /api/models` is unchanged (the profile editor's list).
+- Not verified on the real box: browser rendering, delete permissions and speed on the NAS CIFS mount, scan time on a large share.
 
 ## System tab and portability
 

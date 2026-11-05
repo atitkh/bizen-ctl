@@ -90,7 +90,7 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_loadmap test_gen test_placement test_system; do
+for U in test_loadmap test_gen test_placement test_system test_library; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
@@ -135,6 +135,31 @@ ok "empty token keeps the saved one" $(grep -q "$SEC" "$T/config.json" && echo 1
 curl -s -b "$T/jar" -X POST -d '{"clear_hf_token":true}' $B/api/system/settings | j "print(d['settings']['has_hf_token'])"
 ok "clear removes the token" $(! grep -q "$SEC" "$T/config.json" && echo 1 || echo 0)
 ok "model still the same process after all settings saves" $([ "$STATE0" = "$(curl -s -b "$T/jar" $B/api/status | j "print(d['server']['state'],d['server']['pid'])")" ] && echo 1 || echo 0)
+echo "--- library tab: auth, scan, refusals, delete round trip, draft profile"
+ok "library endpoints need login" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B/api/library)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' $B/api/library/delete)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' $B/api/library/profile)" = 401401401 ] && echo 1 || echo 0)
+mkdir -p "$T/second/lib" "$T/dl/x"
+head -c 4096 /dev/zero > "$T/second/lib/Mini-Q4_K_M-00001-of-00002.gguf"; head -c 4096 /dev/zero > "$T/second/lib/Mini-Q4_K_M-00002-of-00002.gguf"
+head -c 2048 /dev/zero > "$T/dl/x/Free-UD-Q3_K_XL.gguf"; echo keep > "$T/second/lib/notes.txt"
+curl -s -b "$T/jar" $B/api/library > "$T/lib.json"
+jl() { python3 -c "import sys,json;d=json.load(open('$T/lib.json'));m={x['name']:x for x in d['models']};$1"; }
+ok "library: lists models from model_dirs and download_dir, shards grouped" $(jl "k=m['Mini-Q4_K_M'];print(int(k['shards_found']==2 and k['shards_expected']==2 and k['complete'] and k['bytes']==8192 and k['quant']=='Q4_K_M' and m['Free-UD-Q3_K_XL']['quant']=='UD-Q3_K_XL' and 'fit' in k and 'id' in k))")
+ok "library: model used by profiles is flagged, others are not" $(jl "print(int(len(m['model']['used_by'])>=1 and m['Mini-Q4_K_M']['used_by']==[]))")
+MID=$(jl "print(m['Mini-Q4_K_M']['id'])"); UID_=$(jl "print(m['model']['id'])"); FID=$(jl "print(m['Free-UD-Q3_K_XL']['id'])")
+ok "library: /api/models unchanged (plain path + gib)" $(curl -s -b "$T/jar" $B/api/models | j "print(int(all(set(x)=={'path','gib'} for x in d['models'])))")
+ok "library delete: no confirm -> 400, files kept" $([ "$(curl -s -b "$T/jar" -o /dev/null -w '%{http_code}' -X POST -d "{\"id\":\"$MID\"}" $B/api/library/delete)" = 400 ] && [ -f "$T/second/lib/Mini-Q4_K_M-00001-of-00002.gguf" ] && echo 1 || echo 0)
+ok "library delete: used by a profile -> 409, file kept" $([ "$(curl -s -b "$T/jar" -o /dev/null -w '%{http_code}' -X POST -d "{\"id\":\"$UID_\",\"confirm\":\"DELETE\"}" $B/api/library/delete)" = 409 ] && [ -f "$T/model.gguf" ] && echo 1 || echo 0)
+ok "library delete: a client path is not an id" $([ "$(curl -s -b "$T/jar" -o /dev/null -w '%{http_code}' -X POST -d "{\"id\":\"$T/model.gguf\",\"confirm\":\"DELETE\"}" $B/api/library/delete)" = 404 ] && [ -f "$T/model.gguf" ] && echo 1 || echo 0)
+curl -s -b "$T/jar" -X POST -d "{\"id\":\"$FID\"}" $B/api/library/profile > "$T/draft.json"
+ok "library draft: valid unsaved profile from defaults" $(python3 -c "
+import json,re;d=json.load(open('$T/draft.json'));p=d['profile']
+print(int(bool(d['draft'] is True and p['model'].endswith('Free-UD-Q3_K_XL.gguf') and re.fullmatch(r'[A-Za-z0-9._-]+',p['name']) and p['fit'] is True and re.fullmatch(r'auto:\\d+',p['gpus']))))")
+ok "library draft: config untouched (not saved)" $(curl -s -b "$T/jar" $B/api/config | j "print(int('Free-UD-Q3_K_XL' not in [p['name'] for p in d['profiles']]))")
+curl -s -b "$T/jar" -X POST -d "{\"id\":\"$MID\",\"confirm\":\"DELETE\"}" $B/api/library/delete > "$T/ldel.json"
+ok "library delete: round trip frees the set's bytes, leaves other files and the model dir" $(python3 -c "
+import json,os;d=json.load(open('$T/ldel.json'))
+print(int(d['ok'] and d['freed_bytes']==8192 and not os.path.exists('$T/second/lib/Mini-Q4_K_M-00001-of-00002.gguf') and not os.path.exists('$T/second/lib/Mini-Q4_K_M-00002-of-00002.gguf') and os.path.exists('$T/second/lib/notes.txt') and os.path.isdir('$T/second')))")
+ok "library delete: logged in the controller log" $(grep -q "library: deleted Mini-Q4_K_M (2 file(s), 8192 bytes)" "$T/ctl.log" && echo 1 || echo 0)
+rm "$T/second/lib/notes.txt"; rmdir "$T/second/lib" "$T/dl/x" 2>/dev/null; rm -f "$T/dl/x/Free-UD-Q3_K_XL.gguf"; rmdir "$T/dl/x" 2>/dev/null
 echo "--- status.mem has the extended fields"
 curl -s -b "$T/jar" $B/api/status | j "m=d['mem'];print('mem ok' if all(k in m for k in ('total_mib','available_mib','used_mib','free_mib','buffers_mib','cached_mib','swap_used_mib','nodes','child')) and m['used_mib']==m['total_mib']-m['available_mib'] else 'mem MISSING: '+str(sorted(m)))" | tee "$T/o"
 ok "status.mem extended" $(grep -q "^mem ok" "$T/o" && echo 1 || echo 0)

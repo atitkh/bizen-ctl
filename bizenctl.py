@@ -991,43 +991,55 @@ def scan_library(cfg, gpu_mems=None, ram_mib=None, loaded_model=None):
         except (OSError, ValueError):
             return None
 
+    def handle(dp, fn):
+        low = fn.lower()
+        path = os.path.join(dp, fn)
+        if low.endswith(PARTIAL_SUFFIXES):
+            base = fn[:fn.rfind(".")]
+            if ".gguf" not in low or okfile(path) is None:
+                return
+            sm = SHARD_RE.match(base)
+            if sm:
+                partials.setdefault((dp, sm.group(1), sm.group(3)), {})[int(sm.group(2))] = path
+            else:
+                loose_partials.append((dp, path, base))
+            return
+        if not low.endswith(".gguf"):
+            return
+        st = okfile(path)
+        if st is None:
+            return
+        if "mmproj" in low:
+            mmprojs.setdefault(dp, []).append(path)
+            return
+        sm = SHARD_RE.match(fn)
+        if sm:
+            g = groups.setdefault((dp, sm.group(1), sm.group(3)), {
+                "dir": dp, "prefix": sm.group(1), "tstr": sm.group(3), "total": int(sm.group(3)),
+                "width": len(sm.group(2)), "shards": {}})
+            g["shards"][int(sm.group(2))] = (path, st.st_size, st.st_mtime)
+        else:
+            groups[(path,)] = {"dir": dp, "prefix": fn[:-5], "tstr": "1", "total": 1, "width": 0,
+                               "single": path, "shards": {1: (path, st.st_size, st.st_mtime)}}
+
+    later = []             # symlinked files go last so a real file is always listed under its own name
     for wp, _rp in roots:
         try:
             for dp, dns, fns in os.walk(wp, followlinks=False):
                 dns.sort()
                 for fn in sorted(fns):
-                    low = fn.lower()
-                    path = os.path.join(dp, fn)
                     try:
-                        if low.endswith(PARTIAL_SUFFIXES):
-                            base = fn[:fn.rfind(".")]
-                            if ".gguf" not in low or okfile(path) is None:
-                                continue
-                            sm = SHARD_RE.match(base)
-                            if sm:
-                                partials.setdefault((dp, sm.group(1), sm.group(3)), {})[int(sm.group(2))] = path
-                            else:
-                                loose_partials.append((dp, path, base))
-                            continue
-                        if not low.endswith(".gguf"):
-                            continue
-                        st = okfile(path)
-                        if st is None:
-                            continue
-                        if "mmproj" in low:
-                            mmprojs.setdefault(dp, []).append(path)
-                            continue
-                        sm = SHARD_RE.match(fn)
-                        if sm:
-                            g = groups.setdefault((dp, sm.group(1), sm.group(3)), {
-                                "dir": dp, "prefix": sm.group(1), "tstr": sm.group(3), "total": int(sm.group(3)),
-                                "width": len(sm.group(2)), "shards": {}})
-                            g["shards"][int(sm.group(2))] = (path, st.st_size, st.st_mtime)
+                        if os.path.islink(os.path.join(dp, fn)):
+                            later.append((dp, fn))
                         else:
-                            groups[(path,)] = {"dir": dp, "prefix": fn[:-5], "tstr": "1", "total": 1, "width": 0,
-                                               "single": path, "shards": {1: (path, st.st_size, st.st_mtime)}}
+                            handle(dp, fn)
                     except Exception:  # noqa: BLE001
                         continue
+        except Exception:  # noqa: BLE001
+            continue
+    for dp, fn in later:
+        try:
+            handle(dp, fn)
         except Exception:  # noqa: BLE001
             continue
 
