@@ -84,6 +84,9 @@
   .dlcard .err { color: var(--bad); font-size: 12.5px; word-break: break-word; } .dlcard .sub { font-size: 11.5px; color: var(--dim); word-break: break-all; }
   pre.card { white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; font-size: 12px; background: #0f1319; border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
   .empty { padding: 26px 10px; text-align: center; color: var(--dim); }
+  #updModal { position: fixed; inset: 0; background: rgba(8,10,14,.7); display: none; align-items: center; justify-content: center; z-index: 7; }
+  #updModal .box { width: 520px; max-width: 94vw; max-height: 86vh; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 10px; }
+  #updModal pre { margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-all; color: var(--dim); }
   #libModal { position: fixed; inset: 0; background: rgba(8,10,14,.7); display: none; align-items: center; justify-content: center; z-index: 6; }
   #libModal .box { width: 420px; max-width: 92vw; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 10px; }
   #login { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 5; }
@@ -145,10 +148,17 @@
   <span id="state" class="pill s-stopped">stopped</span>
   <span id="hdrProfile" class="note"></span>
   <span class="sp"></span>
+  <span class="chip" id="verChip" style="cursor:pointer" onclick="verLoad(true)" title="Click to re-read the version; Update checks the remote">version …</span>
+  <button id="btnUpdate" onclick="updOpen()" title="Check for a newer bizen-ctl and update this install">Update</button>
   <button class="primary" id="btnStart" onclick="act('start')">Start</button>
   <button id="btnRestart" onclick="act('restart')">Restart</button>
   <button class="danger" id="btnStop" onclick="act('stop')">Stop</button>
 </header>
+<div id="updModal"><div class="box">
+  <h2 style="margin:0">Update bizen-ctl</h2>
+  <div id="updBody" class="note"></div>
+  <div class="row" style="justify-content:flex-end"><button id="updCancel" onclick="updClose()">Close</button><button class="primary" id="updGo" style="display:none" onclick="updApply()">Update now</button></div>
+</div></div>
 
 <main>
   <nav id="nav" class="nav">
@@ -780,9 +790,64 @@ async function loadModels() {
     $('modelList').innerHTML = d.models.map(m => `<option value="${m.path}">${m.gib} GiB</option>`).join('');
   } catch {}
 }
+/* ---- in-app update: header version chip + Update modal (/api/controller/version, /api/controller/update) ---- */
+let updBusy = false;
+function verChip(v) {
+  const c = $('verChip');
+  if (!v || !v.is_git) { c.textContent = v && v.commit ? v.commit : 'not a git checkout'; c.className = 'chip'; c.title = 'This install is not a git checkout, so it cannot update itself here.'; return; }
+  const bits = [v.commit || '?'];
+  let cls = 'chip', tip = (v.branch || '') + (v.upstream ? ' tracking ' + v.upstream : ' (no upstream)') + (v.remote_host ? ' on ' + v.remote_host : '');
+  if (v.dirty) { bits.push('local changes'); cls = 'chip warn'; }
+  else if (v.behind > 0 && v.ahead > 0) { bits.push('diverged'); cls = 'chip warn'; }
+  else if (v.behind > 0) { bits.push(v.behind + ' behind'); cls = 'chip warn'; }
+  else if (v.behind === 0) { bits.push('up to date'); cls = 'chip ok'; }
+  if (v.last_fetch) tip += '\nlast fetch ' + new Date(v.last_fetch * 1000).toLocaleString();
+  c.textContent = bits.join(' · '); c.className = cls; c.title = tip + '\n(behind counts only what the last fetch saw)';
+}
+async function verLoad() {
+  try { verChip(await api('/api/controller/version')); } catch { /* login screen or old controller: leave the chip alone */ }
+}
+function updShow(html, go) { $('updBody').innerHTML = html; $('updGo').style.display = go ? '' : 'none'; $('updGo').disabled = false; }
+async function updOpen() {
+  $('updModal').style.display = 'flex'; $('updCancel').textContent = 'Cancel';
+  updShow('Checking the remote…', false);
+  try { updRender(await api('/api/controller/update', { method: 'POST', body: JSON.stringify({ action: 'check' }) })); }
+  catch (e) { updShow('Could not check: ' + esc(e.message), false); $('updCancel').textContent = 'Close'; }
+  verLoad();
+}
+function updClose() { if (!updBusy) $('updModal').style.display = 'none'; }
+function updRender(r) {
+  $('updCancel').textContent = 'Close';
+  if (!r.ok) { updShow(`<div>Not updating: ${esc(r.reason || 'unknown reason')}.</div>`, false); return; }
+  if (!(r.behind > 0)) { updShow(`<div>Already up to date at <code>${esc(r.commit || '')}</code>${r.upstream ? ' (' + esc(r.upstream) + ')' : ''}.</div>`, false); return; }
+  let h = `<div><b>${r.behind}</b> new commit${r.behind === 1 ? '' : 's'} on ${esc(r.upstream || 'the upstream')}${r.remote_host ? ' (' + esc(r.remote_host) + ')' : ''}:</div><pre>${esc((r.commits || []).join('\n'))}</pre>`;
+  if ((r.files || []).length) h += `<div>Changed files:</div><pre>${esc(r.files.join('\n'))}</pre>`;
+  if (r.would_unload) h += `<div style="color:var(--warn)">Restart needed: the loaded model will be unloaded (reload takes minutes).</div>`;
+  else if (r.restart_needed) h += `<div>Restart needed: the controller restarts (no model is loaded).</div>`;
+  else h += `<div>No restart needed: only the UI or docs changed; the page reloads.</div>`;
+  $('updCancel').textContent = 'Cancel';
+  updShow(h, true);
+}
+async function updApply() {
+  updBusy = true; $('updGo').disabled = true; $('updCancel').disabled = true;
+  $('updBody').insertAdjacentHTML('beforeend', '<div>Updating…</div>');
+  let r;
+  try { r = await api('/api/controller/update', { method: 'POST', body: JSON.stringify({ action: 'apply', confirm: true }) }); }
+  catch (e) { updBusy = false; $('updCancel').disabled = false; updShow('Update failed: ' + esc(e.message), false); return; }
+  if (!r.restarting) { updShow(`Updated ${esc(r.from)} → ${esc(r.to)}. Reloading…`, false); setTimeout(() => location.reload(), 800); return; }
+  updShow(`Updated ${esc(r.from)} → ${esc(r.to)}. Restarting the controller; this page reloads when it is back…`, false);
+  let down = false, tries = 0;
+  const t = setInterval(async () => {
+    tries++;
+    try { await fetch('/api/status', { cache: 'no-store' }); if (down) { clearInterval(t); location.reload(); } }
+    catch { down = true; }
+    if (tries > 150) { clearInterval(t); updBusy = false; $('updCancel').disabled = false; updShow('The controller has not come back after 5 minutes. Check the service (<code>systemctl --user status bizen-ctl</code>); without a supervisor it just stops and must be started by hand.', false); }
+  }, 2000);
+}
+
 async function init() {
   try { await loadConfig(); } catch { return; }
-  loadModels(); loadKevPresets(); loadSystem(false); refresh(); refreshLogs();
+  loadModels(); loadKevPresets(); loadSystem(false); refresh(); refreshLogs(); verLoad();
   $('logs').scrollTop = 1e9;
   if (!window._timers) window._timers = [setInterval(() => { if (!document.hidden) refresh(); }, 2000),
     setInterval(() => { if (!document.hidden && (curTab === 'logs' || curTab === 'kev')) refreshLogs(); }, 2000)];

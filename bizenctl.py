@@ -3031,6 +3031,178 @@ class Sampler:
             return [s for s in self.samples if s["t"] > ts]
 
 
+# ---------------------------------------------------------------- in-app update (git fast-forward of this checkout)
+
+CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]*@")
+RESTART_FILES = ("bizenctl.py", "install.sh")   # a change to either needs a controller restart
+UPDATE_FETCH_TIMEOUT = 60
+UPDATE_PULL_TIMEOUT = 90
+
+
+def redact(s):
+    """Strip user:pass@ from any URL inside a string (anything shown or logged goes through this)."""
+    return CRED_RE.sub(r"\1", s or "")
+
+
+def _term_self():
+    os.kill(os.getpid(), signal.SIGTERM)   # same graceful path as POST /api/controller/restart
+
+
+class Updater:
+    """Fast-forward-only self update from the checkout's upstream. Never raises; one operation at a time."""
+
+    def __init__(self, repo=HERE, sup=None, restart_hook=None, delay=1.5):
+        self.repo, self.sup = repo, sup
+        self.restart_hook = restart_hook or _term_self
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.restarting = False
+
+    # -- git plumbing
+    def git(self, *args, timeout=15):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true", LC_ALL="C")
+        try:
+            r = subprocess.run(["git", "-C", self.repo, "--no-pager"] + list(args), capture_output=True,
+                               text=True, timeout=timeout, env=env)
+            return r.returncode, redact(r.stdout).strip(), redact(r.stderr).strip()
+        except subprocess.TimeoutExpired:
+            return 124, "", f"git {args[0]} timed out after {timeout} s"
+        except (OSError, ValueError) as e:
+            return 127, "", redact(str(e))
+
+    def is_git(self):
+        rc, out, _ = self.git("rev-parse", "--show-toplevel")
+        return rc == 0 and os.path.realpath(out) == os.path.realpath(self.repo)
+
+    @staticmethod
+    def host_of(url):
+        url = redact(url or "").strip()
+        m = re.match(r"^[\w.-]+@([^:/\s]+):", url)            # scp-like git@host:path
+        if m:
+            return m.group(1)
+        try:
+            return urllib.parse.urlsplit(url).hostname
+        except ValueError:
+            return None
+
+    def model_loaded(self):
+        return bool(self.sup and getattr(self.sup, "state", "") in ("running", "starting"))
+
+    def info(self):
+        """Everything GET /api/controller/version returns."""
+        out = {"is_git": False, "commit": None, "commit_full": None, "branch": None, "dirty": None,
+               "remote_host": None, "upstream": None, "ahead": None, "behind": None, "last_fetch": None,
+               "busy": self.lock.locked() or self.restarting}
+        if not self.is_git():
+            return out
+        out["is_git"] = True
+        rc, full, _ = self.git("rev-parse", "HEAD")
+        if rc == 0:
+            out["commit_full"], out["commit"] = full, full[:7]
+        rc, br, _ = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        out["branch"] = br if rc == 0 else None
+        rc, st, _ = self.git("status", "--porcelain")
+        out["dirty"] = bool(st) if rc == 0 else None
+        rc, up, _ = self.git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        out["upstream"] = up if rc == 0 and up else None
+        remote = up.split("/", 1)[0] if out["upstream"] else "origin"
+        rc, url, _ = self.git("remote", "get-url", remote)
+        out["remote_host"] = self.host_of(url) if rc == 0 else None
+        if out["upstream"]:
+            rc, cnt, _ = self.git("rev-list", "--left-right", "--count", "HEAD...@{u}")
+            if rc == 0 and len(cnt.split()) == 2:
+                out["ahead"], out["behind"] = (int(x) for x in cnt.split())
+        rc, gd, _ = self.git("rev-parse", "--git-dir")
+        if rc == 0:
+            try:
+                out["last_fetch"] = os.path.getmtime(os.path.join(self.repo, gd, "FETCH_HEAD"))
+            except OSError:
+                pass
+        return out
+
+    # -- check / apply
+    def check(self, fetch=True):
+        """Fetch and describe what an update would bring. {ok: False, reason} when it must not be applied."""
+        v = self.info()
+        res = {"ok": False, "reason": None, "commit": v["commit"], "branch": v["branch"], "upstream": v["upstream"],
+               "ahead": v["ahead"], "behind": v["behind"], "dirty": v["dirty"], "remote_host": v["remote_host"],
+               "commits": [], "files": [], "restart_needed": False,
+               "model_loaded": self.model_loaded(), "would_unload": False}
+        if not v["is_git"]:
+            res["reason"] = "this install is not a git checkout, so it cannot update itself (use your package or copy method)"
+        elif not v["upstream"]:
+            res["reason"] = "the current branch has no upstream to update from"
+        elif v["dirty"]:
+            res["reason"] = "the working tree has local changes; commit or stash them first"
+        elif v["dirty"] is None:
+            res["reason"] = "could not read the git status"
+        if res["reason"]:
+            return res
+        if fetch:
+            rc, _, err = self.git("fetch", "--quiet", timeout=UPDATE_FETCH_TIMEOUT)
+            if rc != 0:
+                res["reason"] = "git fetch failed: " + (err.splitlines()[-1] if err else f"exit {rc}")
+                return res
+            v = self.info()
+            res.update(ahead=v["ahead"], behind=v["behind"])
+        if v["ahead"] is None or v["behind"] is None:
+            res["reason"] = "could not compare with the upstream"
+        elif v["ahead"] and v["behind"]:
+            res["reason"] = f"local and upstream have diverged ({v['ahead']} ahead, {v['behind']} behind); resolve by hand"
+        elif v["ahead"]:
+            res["reason"] = f"{v['ahead']} local commit(s) not on the upstream; nothing to pull"
+        if res["reason"]:
+            return res
+        res["ok"] = True
+        if v["behind"]:
+            rc, lg, _ = self.git("log", "--oneline", "-n", "20", "HEAD..@{u}")
+            res["commits"] = lg.splitlines() if rc == 0 and lg else []
+            rc, fl, _ = self.git("diff", "--name-only", "HEAD..@{u}")
+            res["files"] = fl.splitlines() if rc == 0 and fl else []
+            res["restart_needed"] = any(f in RESTART_FILES for f in res["files"])
+            res["would_unload"] = res["restart_needed"] and res["model_loaded"]
+        return res
+
+    def apply(self, confirm):
+        """Returns (http_code, body). On a restart the caller must send the body, then call schedule_restart()."""
+        if confirm is not True:
+            return 400, {"ok": False, "reason": "confirm:true required"}
+        if self.restarting or not self.lock.acquire(blocking=False):
+            return 409, {"ok": False, "reason": "another update is already running"}
+        try:
+            chk = self.check()
+            if not chk["ok"]:
+                log("update apply refused: " + redact(chk["reason"]))
+                return 409, {"ok": False, "reason": chk["reason"]}
+            frm = chk["commit"]
+            if not chk["behind"]:
+                return 200, {"ok": True, "from": frm, "to": frm, "restart_needed": False, "restarting": False,
+                             "note": "already up to date"}
+            rc, _, err = self.git("pull", "--ff-only", "--quiet", timeout=UPDATE_PULL_TIMEOUT)
+            if rc != 0:
+                reason = "git pull --ff-only failed: " + (err.splitlines()[-1] if err else f"exit {rc}")
+                log("update apply failed: " + reason)
+                return 500, {"ok": False, "reason": reason}
+            to = self.info()["commit"]
+            restart = chk["restart_needed"]
+            log(f"update applied: {frm} -> {to}" + (" (restarting controller)" if restart else " (no restart needed)"))
+            if restart:
+                self.restarting = True
+            return 200, {"ok": True, "from": frm, "to": to, "restart_needed": restart, "restarting": restart,
+                         "files": chk["files"]}
+        finally:
+            self.lock.release()
+
+    def schedule_restart(self):
+        def go():
+            time.sleep(self.delay)
+            try:
+                self.restart_hook()
+            except Exception as e:  # noqa: BLE001
+                log("update restart hook failed: " + redact(str(e)))
+        threading.Thread(target=go, daemon=True).start()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"   # close-delimited bodies keep streaming proxying simple
     server_version = "bizen-ctl"
@@ -3333,6 +3505,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not d.get("run"):
                 return self.send_json({"decision": dec})
             return self.test_prompt(prompt, profile=dec["profile"], decision=dec)
+        if path == "/api/controller/version" and method == "GET":
+            return self.send_json(self.server.updater.info())
+        if path == "/api/controller/update" and method == "POST":
+            d = self.json_body()
+            up = self.server.updater
+            if not isinstance(d, dict) or d.get("action") not in ("check", "apply"):
+                return self.send_json({"error": "send {action: 'check'|'apply'}"}, 400)
+            if d["action"] == "check":
+                if not up.lock.acquire(blocking=False):
+                    return self.send_json({"ok": False, "reason": "another update is already running"})
+                try:
+                    res = up.check()
+                finally:
+                    up.lock.release()
+                log("update check: " + (f"{res['behind']} behind" if res["ok"] else "refused: " + redact(res["reason"])))
+                return self.send_json(res)
+            code, body = up.apply(d.get("confirm"))
+            self.send_json(body, code)
+            if body.get("restarting"):
+                up.schedule_restart()
+            return
         if path == "/api/controller/restart" and method == "POST":
             self.send_json({"ok": True})
             threading.Thread(target=lambda: (time.sleep(0.5), os.kill(os.getpid(), signal.SIGTERM)), daemon=True).start()
@@ -3583,6 +3776,7 @@ def main():
     srv = Server((cfg.get("listen_host"), cfg.get("listen_port")), Handler)
     srv.cfg, srv.sup, srv.kev, srv.router = cfg, sup, kev, router
     srv.dl = Downloader(cfg)
+    srv.updater = Updater(HERE, sup)
     srv.sampler = Sampler(sup)
     srv.sampler.start()
 
