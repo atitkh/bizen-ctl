@@ -90,7 +90,7 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_modelnames test_loadmap test_gen test_placement test_system test_library test_download test_update; do
+for U in test_modelnames test_loadmap test_gen test_placement test_system test_library test_download test_update test_helpers; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
