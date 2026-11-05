@@ -90,7 +90,7 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_loadmap test_gen test_placement test_system test_library; do
+for U in test_loadmap test_gen test_placement test_system test_library test_download; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
@@ -265,6 +265,92 @@ curl -s -b "$T/jar2" "$B2/api/metrics" | j "print('genmetrics',all('gen' in x fo
 ok "metrics samples carry gen, with an active span" $(grep -q "genmetrics True" "$T/o" && echo 1 || echo 0)
 kill $CTL2; sleep 2
 CH2=$(pgrep -f "config2.json" | head -1); [ -n "$CH2" ] && kill $CH2
+echo "--- hugging face: browse + downloads against test/mock-hf.py (HF 18981, CDN 18982), own controller on 18995"
+python3 -u "$D/test/mock-hf.py" 18981 18982 > "$T/mockhf.log" 2>&1 &
+MHF=$!
+mkdir -p "$T/hfdl"
+python3 - "$T/config.json" "$T/config3.json" "$T/hfdl" <<'EOF4'
+import json,sys
+c=json.load(open(sys.argv[1])); c.update(listen_port=18995, internal_port=18996, idle_ttl_min=0, download_dir=sys.argv[3], model_dirs=[sys.argv[3]],
+    hf_endpoint="http://127.0.0.1:18981", hf_token="hf_testtoken", min_free_gib_for_download=0)
+c["kev"]=dict(c["kev"], managed=False); c["router"]=dict(c["router"], enabled=False)
+json.dump(c,open(sys.argv[2],"w"))
+EOF4
+B3=http://127.0.0.1:18995
+python3 -u "$D/bizenctl.py" --config "$T/config3.json" > "$T/ctl3.log" 2>&1 &
+CTL3=$!; sleep 1
+H3() { curl -s -b "$T/jar3" "$@"; }
+wait_dl() { for i in $(seq 1 ${3:-30}); do s=$(H3 $B3/api/downloads | j "print(next((x['state'] for x in d if x['id']=='$1'),''))"); [ "$s" = "$2" ] && return 0; sleep 1; done; return 1; }
+ok "hf/downloads endpoints need login" $([ "$(curl -s -o /dev/null -w '%{http_code}' "$B3/api/hf/search?q=a")$(curl -s -o /dev/null -w '%{http_code}' "$B3/api/hf/repo?id=acme/Tiny-GGUF")$(curl -s -o /dev/null -w '%{http_code}' $B3/api/downloads)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' $B3/api/downloads)$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' $B3/api/downloads/aaaaaaaa/cancel)" = 401401401401401 ] && echo 1 || echo 0)
+curl -s -c "$T/jar3" -X POST -d '{"password":"pw"}' $B3/api/login >/dev/null
+H3 "$B3/api/hf/search?q=tiny&sort=downloads&limit=5" | j "r=d['results'];print('search',[x['id'] for x in r],sorted(r[0])==sorted(['id','author','downloads','likes','last_modified','tags','private','gated']))" | tee "$T/o"
+ok "hf search: shape and filtering" $(grep -q "^search \['acme/Tiny-GGUF', 'other/Tiny-Chat-GGUF'\] True" "$T/o" && echo 1 || echo 0)
+ok "hf search: bad sort -> 400" $([ "$(H3 -o /dev/null -w '%{http_code}' "$B3/api/hf/search?q=a&sort=evil")" = 400 ] && echo 1 || echo 0)
+H3 "$B3/api/hf/repo?id=acme/Tiny-GGUF" | j "s={x['name']:x for x in d['sets']};print('repo',sorted(s),s['Tiny-UD-Q3_K_XL']['shards'],s['Tiny-UD-Q3_K_XL']['gib'],s['Tiny-Q4_K_M']['fit']['verdict'] in (None,'fits-vram','needs-ram','too-big'),d['license'],len(d['card']),d['has_token'])" | tee "$T/o"
+ok "hf repo: quant sets grouped, fit present, card capped, hints" $(grep -q "^repo \['Tiny-Q4_K_M', 'Tiny-Q8_0', 'Tiny-UD-Q3_K_XL'\] 3 0.01 True apache-2.0 20000 True" "$T/o" && echo 1 || echo 0)
+ok "hf repo: bad id -> 400, unknown repo -> 404 readable" $([ "$(H3 -o /dev/null -w '%{http_code}' "$B3/api/hf/repo?id=../etc")$(H3 -o "$T/o" -w '%{http_code}' "$B3/api/hf/repo?id=acme/Nope")" = 400404 ] && grep -q "repo not found" "$T/o" && echo 1 || echo 0)
+ok "downloads: traversal / bad names / unknown repo refused (400)" $([ "$(H3 -o /dev/null -w '%{http_code}' -X POST -d '{"repo":"acme/Tiny-GGUF","files":["../../x.gguf"]}' $B3/api/downloads)$(H3 -o /dev/null -w '%{http_code}' -X POST -d '{"repo":"../x/y","files":["a.gguf"]}' $B3/api/downloads)$(H3 -o /dev/null -w '%{http_code}' -X POST -d '{"repo":"acme/Tiny-GGUF","files":"nope"}' $B3/api/downloads)" = 400400400 ] && echo 1 || echo 0)
+echo "--- hf: full round trip (3 shards), lands in the Library scan"
+SHARDS='["UD-Q3_K_XL/Tiny-UD-Q3_K_XL-00001-of-00003.gguf","UD-Q3_K_XL/Tiny-UD-Q3_K_XL-00002-of-00003.gguf","UD-Q3_K_XL/Tiny-UD-Q3_K_XL-00003-of-00003.gguf"]'
+DID=$(H3 -X POST -d "{\"repo\":\"acme/Tiny-GGUF\",\"files\":$SHARDS}" $B3/api/downloads | j "print(d['download']['id'])")
+sleep 0.3; H3 $B3/api/status | j "print('active key', 'downloads_active' in d)" | tee "$T/o"
+ok "status carries downloads_active" $(grep -q "^active key True" "$T/o" && echo 1 || echo 0)
+ok "download completes" $(wait_dl "$DID" done 30 && echo 1 || echo 0)
+H3 $B3/api/downloads | j "x=d[0];print('dl',x['state'],x['bytes_done']==x['bytes_total']==6297456,x['pct'],len(x['files']),x['error'])" | tee "$T/o"
+ok "download entry: done, bytes match, 100%" $(grep -q "^dl done True 100.0 3 None" "$T/o" && echo 1 || echo 0)
+H3 $B3/api/library | j "m=[x for x in d['models'] if x['name']=='Tiny-UD-Q3_K_XL'];print('lib',len(m),m and m[0]['complete'],m and m[0]['shards_found'],m and m[0]['quant'])" | tee "$T/o"
+ok "finished download shows up in /api/library (complete, 3 shards)" $(grep -q "^lib 1 True 3 UD-Q3_K_XL" "$T/o" && echo 1 || echo 0)
+H3 "$B3/api/hf/repo?id=acme/Tiny-GGUF" | j "print('have',[x['already_downloaded'] for x in d['sets']])" | tee "$T/o"
+ok "hf repo marks the downloaded set as already_downloaded" $(grep -q "^have \[False, False, True\]" "$T/o" && echo 1 || echo 0)
+ok "downloading it again -> 409 already downloaded" $([ "$(H3 -o /dev/null -w '%{http_code}' -X POST -d "{\"repo\":\"acme/Tiny-GGUF\",\"files\":$SHARDS}" $B3/api/downloads)" = 409 ] && echo 1 || echo 0)
+ok "token not sent to the CDN, sent to the HF host" $(curl -s http://127.0.0.1:18981/_log | python3 -c "
+import sys,json
+l=json.load(sys.stdin)
+cdn=[e for e in l if e['port']==18982]; hf=[e for e in l if e['port']==18981 and 'resolve' in e['path']]
+print(int(len(cdn)>=3 and all(e['auth'] is None for e in cdn) and len(hf)>=3 and all(e['auth']=='Bearer hf_testtoken' for e in hf)))")
+H3 -X POST $B3/api/downloads/$DID/remove -d '{}' > /dev/null
+echo "--- hf: cancel mid-transfer keeps the .part, resume continues with Range"
+curl -s -X POST "http://127.0.0.1:18981/_slow?s=0.1" >/dev/null; curl -s -X POST http://127.0.0.1:18981/_reset >/dev/null
+DID=$(H3 -X POST -d '{"repo":"acme/Tiny-GGUF","files":["Tiny-Q8_0.gguf"]}' $B3/api/downloads | j "print(d['download']['id'])")
+for i in $(seq 1 30); do n=$(H3 $B3/api/downloads | j "print(next((x['bytes_done'] for x in d if x['id']=='$DID'),0))"); [ "$n" -gt 300000 ] && break; sleep 0.3; done
+H3 -X POST -d '{}' $B3/api/downloads/$DID/cancel | j "print('cancel',d['download']['state'])" | tee "$T/o"
+ok "cancel stops the transfer (state canceled)" $(grep -q "^cancel canceled" "$T/o" && echo 1 || echo 0)
+PART="$T/hfdl/Tiny-GGUF/files/Tiny-Q8_0.gguf.part"
+ok "cancel keeps the .part and no final file" $([ -s "$PART" ] && [ ! -e "${PART%.part}" ] && echo 1 || echo 0)
+PSZ=$(stat -c %s "$PART")
+curl -s -X POST "http://127.0.0.1:18981/_slow?s=0" >/dev/null; curl -s -X POST http://127.0.0.1:18981/_reset >/dev/null
+H3 -X POST -d '{}' $B3/api/downloads/$DID/resume >/dev/null
+ok "resume after cancel finishes" $(wait_dl "$DID" done 30 && echo 1 || echo 0)
+ok "resumed file is complete and sane (2 MiB, no .part left)" $([ "$(stat -c %s "${PART%.part}")" = 2097152 ] && [ ! -e "$PART" ] && echo 1 || echo 0)
+ok "resume used Range from the .part size" $(curl -s http://127.0.0.1:18981/_log | python3 -c "
+import sys,json
+c=[e for e in json.load(sys.stdin) if e['port']==18982 and 'Q8_0' in e['path']]
+print(int(bool(c) and c[0]['range']=='bytes=$PSZ-'))")
+python3 - "$T/hfdl/Tiny-GGUF/files/Tiny-Q8_0.gguf" > "$T/o" <<'EOF5'
+import hashlib,sys
+pat=hashlib.sha256(b"Tiny-Q8_0.gguf").digest(); n=2*1024*1024
+print("same", open(sys.argv[1],"rb").read()==(pat*(n//32+2))[:n])
+EOF5
+ok "resumed bytes are identical to the source" $(grep -q "^same True" "$T/o" && echo 1 || echo 0)
+echo "--- hf: restart shows an interrupted download as paused and never auto-starts"
+H3 -X POST $B3/api/downloads/$DID/remove -d '{}' >/dev/null
+curl -s -X POST "http://127.0.0.1:18981/_slow?s=0.3" >/dev/null
+DID=$(H3 -X POST -d '{"repo":"acme/Tiny-GGUF","files":["Tiny-Q4_K_M.gguf"]}' $B3/api/downloads | j "print(d['download']['id'])")
+sleep 1.5; { kill -9 $CTL3; wait $CTL3; } 2>/dev/null; sleep 0.5
+python3 -u "$D/bizenctl.py" --config "$T/config3.json" >> "$T/ctl3.log" 2>&1 &
+CTL3=$!; sleep 1.2
+curl -s -c "$T/jar3" -X POST -d '{"password":"pw"}' $B3/api/login >/dev/null
+sleep 2
+H3 $B3/api/downloads | j "x=d[0];print('after restart',x['id']=='$DID',x['state'],x['bytes_done']>0,x['bytes_done']<x['bytes_total'])" | tee "$T/o"
+ok "interrupted download comes back paused with its partial progress" $(grep -q "^after restart True paused True True" "$T/o" && echo 1 || echo 0)
+H3 $B3/api/status | j "print('idle',d['downloads_active'])" | tee "$T/o"
+ok "nothing auto-starts after a restart" $(grep -q "^idle None" "$T/o" && echo 1 || echo 0)
+curl -s -X POST "http://127.0.0.1:18981/_slow?s=0" >/dev/null
+H3 -X POST -d '{}' $B3/api/downloads/$DID/resume >/dev/null
+ok "paused entry resumes after the restart" $(wait_dl "$DID" done 30 && echo 1 || echo 0)
+ok "hf_token appears nowhere in the controller log or downloads.json" $([ "$(cat "$T/ctl3.log" "$T/downloads.json" | grep -c hf_testtoken)" = 0 ] && echo 1 || echo 0)
+ok "hf_token not returned by GET /api/config, /api/downloads, /api/hf/repo" $([ "$(H3 $B3/api/config $B3/api/downloads "$B3/api/hf/repo?id=acme/Tiny-GGUF" | grep -c hf_testtoken)" = 0 ] && echo 1 || echo 0)
+kill $CTL3; kill $MHF; sleep 1
 echo "--- controller log"; cat "$T/ctl.log"
 echo "--- result"; if [ "$FAILS" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; fi
 exit $([ "$FAILS" = 0 ] && echo 0 || echo 1)

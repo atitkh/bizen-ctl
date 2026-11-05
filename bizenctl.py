@@ -1269,14 +1269,14 @@ class HFError(Exception):
 
 def hf_valid_repo(repo):
     r = str(repo or "")
-    if len(r) > 200 or not HF_REPO_RE.match(r):
+    if len(r) > 200 or not HF_REPO_RE.fullmatch(r):
         return False
     return not any(set(part) <= {"."} for part in r.split("/"))
 
 
 def hf_valid_file(path):
     p = str(path or "")
-    if len(p) > 400 or not HF_FILE_RE.match(p) or ".." in p:
+    if len(p) > 400 or not HF_FILE_RE.fullmatch(p) or ".." in p or "." in p.split("/"):
         return False
     return p.lower().endswith(".gguf")
 
@@ -1406,6 +1406,11 @@ def run_with_deadline(fn, deadline):
     return box["v"]
 
 
+def _tok_id(token):
+    """In-memory cache key part: a different token never reuses another token's cached answer (the token itself is not kept)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:10] if token else ""
+
+
 def _hf_cache_get(key):
     with _HF_CACHE_LOCK:
         hit = _HF_CACHE.get(key)
@@ -1448,7 +1453,7 @@ def hf_search(cfg, q, sort, limit):
     """cfg: plain config dict. Returns {"results": [...], "query", "sort", "cached"}. Raises HFError."""
     endpoint = str(cfg.get("hf_endpoint") or DEFAULTS["hf_endpoint"]).rstrip("/")
     token = str(cfg.get("hf_token") or "")
-    key = ("search", endpoint, bool(token), q, sort, limit)
+    key = ("search", endpoint, _tok_id(token), q, sort, limit)
     hit = _hf_cache_get(key)
     if hit is not None:
         return dict(hit, cached=True)
@@ -1558,7 +1563,7 @@ def hf_repo_raw(cfg, repo):
     Cached 60 s. Raises HFError."""
     endpoint = str(cfg.get("hf_endpoint") or DEFAULTS["hf_endpoint"]).rstrip("/")
     token = str(cfg.get("hf_token") or "")
-    key = ("repo", endpoint, bool(token), repo)
+    key = ("repo", endpoint, _tok_id(token), repo)
     hit = _hf_cache_get(key)
     if hit is not None:
         return hit
@@ -2112,9 +2117,6 @@ class Downloader:
                         mode = "ab"
                     else:
                         existing, mode = 0, "wb"      # 200: the server ignored Range or the file changed: start over
-                        cl = resp.getheader("Content-Length")
-                        if cl and cl.isdigit() and int(cl) != f["bytes"]:
-                            raise DlFail(f"{name}: server reports {cl} bytes, expected {f['bytes']}")
                     et = resp.getheader("ETag")
                     if et and not et.startswith("W/"):
                         it.validators[f["path"]] = et
