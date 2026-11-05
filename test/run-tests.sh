@@ -90,7 +90,7 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_loadmap test_gen test_placement test_system test_library test_download test_update; do
+for U in test_modelnames test_loadmap test_gen test_placement test_system test_library test_download test_update; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
@@ -355,6 +355,89 @@ ok "paused entry resumes after the restart" $(wait_dl "$DID" done 30 && echo 1 |
 ok "hf_token appears nowhere in the controller log or downloads.json" $([ "$(cat "$T/ctl3.log" "$T/downloads.json" | grep -c hf_testtoken)" = 0 ] && echo 1 || echo 0)
 ok "hf_token not returned by GET /api/config, /api/downloads, /api/hf/repo" $([ "$(H3 $B3/api/config $B3/api/downloads "$B3/api/hf/repo?id=acme/Tiny-GGUF" | grep -c hf_testtoken)" = 0 ] && echo 1 || echo 0)
 kill $CTL3; kill $MHF; sleep 1
+echo "--- model names: profile name picks the profile, auto = whatever is active, 404 / busy"
+python3 - "$T/config.json" "$T/config4.json" <<'EOF6'
+import json,sys
+c=json.load(open(sys.argv[1])); c.update(listen_port=18997, internal_port=18998, idle_ttl_min=0, switch_wait_s=3, active_profile="qwen36-2gpu")
+c["kev"]=dict(c["kev"], managed=False); c["router"]=dict(c["router"], enabled=False)
+json.dump(c,open(sys.argv[2],"w"))
+EOF6
+B4=http://127.0.0.1:18997
+MOCK_TOKENS=20 python3 -u "$D/bizenctl.py" --config "$T/config4.json" > "$T/ctl4.log" 2>&1 &
+CTL4=$!; sleep 1
+curl -s -c "$T/jar4" -X POST -d '{"password":"pw"}' $B4/api/login >/dev/null
+H4() { curl -s -b "$T/jar4" "$@"; }
+K4=(-H "Authorization: Bearer k1")
+req4() { # model [extra json]: prints "<code> <X-Bizen-Profile>"
+  curl -s -D "$T/hh" -o "$T/hb" -w "%{http_code}" "${K4[@]}" $B4/v1/chat/completions -d "{$1\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" | tr -d '\n'
+  echo " $(grep -i '^x-bizen-profile' "$T/hh" | tr -d '\r' | awk '{print $2}')"; }
+ok "/v1/models lists every profile + auto (router disabled)" $(curl -s "${K4[@]}" $B4/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);i=[m['id'] for m in d['data']];print(int(i==['qwen36-2gpu','qwen36-1gpu','auto'] and all(m['owned_by']=='bizen-ctl' for m in d['data'])))")
+ok "/v1/models needs the API key" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B4/v1/models)" = 401 ] && echo 1 || echo 0)
+R=$(req4 '"model":"qwen36-1gpu",'); echo "cold named: $R"
+ok "named profile from cold starts that profile (X-Bizen-Profile)" $([ "$R" = "200 qwen36-1gpu" ] && echo 1 || echo 0)
+R=$(req4 '"model":"qwen36-2gpu",'); echo "named switch: $R"
+ok "named other profile while idle switches and serves it" $([ "$R" = "200 qwen36-2gpu" ] && echo 1 || echo 0)
+ok "status shows the switched profile" $(H4 $B4/api/status | j "print(int(d['server']['profile']=='qwen36-2gpu'))")
+R=$(req4 '"model":"qwen36-1gpu",'); R2=$(req4 '"model":"auto",'); R3=$(req4 ''); R4=$(req4 '"model":"",'); R5=$(req4 '"model":7,')
+echo "auto after named 1gpu: $R2 / no model: $R3 / empty: $R4 / int: $R5"
+ok "auto (router off) keeps the loaded profile, never switches back to the active one" $([ "$R2" = "200 qwen36-1gpu" ] && echo 1 || echo 0)
+ok "missing / empty / non-string model behave like auto" $([ "$R3 $R4 $R5" = "200 qwen36-1gpu 200 qwen36-1gpu 200 qwen36-1gpu" ] && echo 1 || echo 0)
+H4 -X POST $B4/api/stop >/dev/null; sleep 1.5
+R=$(req4 '"model":"auto",'); echo "auto from stopped: $R"
+ok "auto from stopped starts the configured active profile" $([ "$R" = "200 qwen36-2gpu" ] && echo 1 || echo 0)
+echo "--- model names: unknown -> 404 listing the available names; lenient mode"
+curl -s -o "$T/hb" -w "%{http_code}" "${K4[@]}" $B4/v1/chat/completions -d '{"model":"gpt-4","messages":[]}' > "$T/o"; echo >> "$T/o"
+ok "unknown model -> 404" $(grep -q '^404' "$T/o" && echo 1 || echo 0)
+ok "404 body: model_not_found + available names + auto" $(python3 -c "
+import json;e=json.load(open('$T/hb'))['error'];print(int(e['type']=='model_not_found' and e['message']=='unknown model \'gpt-4\'; available: qwen36-2gpu, qwen36-1gpu, auto'))")
+R=$(req4 '"model":"QWEN36-1GPU",'); echo "case: $R"
+ok "model names are case sensitive (404)" $([ "${R%% *}" = 404 ] && echo 1 || echo 0)
+ok "404 did not touch the loaded model" $(H4 $B4/api/status | j "print(int(d['server']['profile']=='qwen36-2gpu' and d['server']['inflight']==0))")
+curl -s -o /dev/null -w "%{http_code} " "${K4[@]}" $B4/v1/embeddings -d '{"model":"nope","input":"x"}'
+curl -s -o /dev/null -w "%{http_code} " "${K4[@]}" $B4/v1/completions -d '{"model":"nope","prompt":"x"}'
+curl -s -o /dev/null -w "%{http_code}\n" "${K4[@]}" $B4/v1/embeddings -d 'not json'
+BJ=$(curl -s -o /dev/null -w '%{http_code}' "${K4[@]}" $B4/v1/chat/completions -d 'not json')   # the mock itself rejects bad JSON (502): what matters is that it reached the loaded profile, not 404/500
+ok "bad JSON body falls through to the old path (like auto), controller fine" $([ "$BJ" != 404 ] && [ "$BJ" != 500 ] && [ "$(req4 '')" = "200 qwen36-2gpu" ] && echo 1 || echo 0)
+H4 $B4/api/config | j "d['strict_model_names']=False;print(json.dumps(d))" > "$T/lenient.json"
+H4 -X PUT --data @"$T/lenient.json" $B4/api/config | j "print('saved',d['ok'])"
+R=$(req4 '"model":"gpt-4",'); echo "lenient unknown: $R"
+ok "strict_model_names=false: unknown name served like auto" $([ "$R" = "200 qwen36-2gpu" ] && echo 1 || echo 0)
+H4 $B4/api/config | j "d['strict_model_names']=True;print(json.dumps(d))" > "$T/strict.json"; H4 -X PUT --data @"$T/strict.json" $B4/api/config >/dev/null
+echo "--- model names: busy -> wait then 503 (switch_wait_s=3), running generation is not cut off"
+curl -sN "${K4[@]}" $B4/v1/chat/completions -d '{"model":"qwen36-2gpu","stream":true,"messages":[]}' > "$T/stream.out" &
+SP=$!; sleep 1
+S0=$(date +%s.%N)
+curl -s -D "$T/hh" -o "$T/hb" -w "%{http_code}" "${K4[@]}" $B4/v1/chat/completions -d '{"model":"qwen36-1gpu","messages":[]}' > "$T/o"; echo >> "$T/o"
+EL=$(python3 -c "import time;print(round(time.time()-$S0,1))")
+echo "busy answer after ${EL}s: $(cat "$T/o") $(cat "$T/hb" | head -c 200)"
+ok "other profile while one streams -> 503" $(grep -q '^503' "$T/o" && echo 1 || echo 0)
+ok "503 body is busy + names the loaded profile" $(python3 -c "
+import json;e=json.load(open('$T/hb'))['error'];print(int(e['type']=='busy' and e['message'].startswith('busy: qwen36-2gpu is serving 1 request(s)')))")
+ok "503 carries Retry-After: 30" $(grep -qi '^retry-after: 30' "$T/hh" && echo 1 || echo 0)
+ok "it waited about switch_wait_s (3 s) first" $(python3 -c "print(int(2.6<=$EL<=5.5))")
+wait $SP
+ok "the running stream finished intact (no cut-off)" $(grep -q "DONE" "$T/stream.out" && [ "$(grep -c 'w[0-9]' "$T/stream.out")" = 20 ] && echo 1 || echo 0)
+ok "still the same profile loaded after the 503" $(H4 $B4/api/status | j "print(int(d['server']['profile']=='qwen36-2gpu'))")
+echo "--- model names: busy then free within the wait -> switches and serves"
+H4 $B4/api/config | j "d['switch_wait_s']=30;print(json.dumps(d))" > "$T/w30.json"; H4 -X PUT --data @"$T/w30.json" $B4/api/config >/dev/null
+curl -sN "${K4[@]}" $B4/v1/chat/completions -d '{"model":"qwen36-2gpu","stream":true,"messages":[]}' > "$T/stream.out" &
+SP=$!; sleep 1
+R=$(req4 '"model":"qwen36-1gpu",'); echo "after waiting: $R"
+ok "waiter gets the other profile once the stream is done" $([ "$R" = "200 qwen36-1gpu" ] && echo 1 || echo 0)
+wait $SP
+ok "the stream that was running was not cut off by the switch" $(grep -q "DONE" "$T/stream.out" && echo 1 || echo 0)
+echo "--- model names: no thrash (a waiter for A while B was started for someone else)"
+H4 -X POST $B4/api/stop >/dev/null; sleep 1.5
+curl -sN "${K4[@]}" $B4/v1/chat/completions -d '{"model":"qwen36-1gpu","stream":true,"messages":[]}' > "$T/s1.out" &
+S1=$!; sleep 1
+( req4 '"model":"qwen36-2gpu",' > "$T/w2.out" ) &
+W2=$!; sleep 1
+curl -sN "${K4[@]}" $B4/v1/chat/completions -d '{"model":"qwen36-1gpu","stream":true,"messages":[]}' > "$T/s2.out"   # same profile as the first: just served
+ok "request for the loaded profile is served immediately while another waits" $(grep -q DONE "$T/s2.out" && echo 1 || echo 0)
+wait $S1 $W2
+ok "the waiter switched only after the 1gpu requests ended" $([ "$(cat "$T/w2.out")" = "200 qwen36-2gpu" ] && grep -q DONE "$T/s1.out" && echo 1 || echo 0)
+H4 $B4/api/status | j "print('final',d['server']['profile'],d['server']['inflight'])"
+kill $CTL4; sleep 1
 echo "--- controller log"; cat "$T/ctl.log"
 echo "--- result"; if [ "$FAILS" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; fi
 exit $([ "$FAILS" = 0 ] && echo 0 || echo 1)

@@ -58,7 +58,7 @@ Kev (a small decision model) picks which profile should answer a prompt.
    - `POST /v1/chat/completions` with `"model": "auto"` (the alias is configurable). Kev picks the
      profile, the controller switches to it, and you get the answer.
    - `POST /v1/route` with `{"prompt": "..."}` returns Kev's decision only. Nothing is loaded.
-   - `GET /v1/models` lists the profiles and the alias.
+   - `GET /v1/models` lists the profiles and the alias (always, even with the router off).
 4. Response headers on routed requests: `X-Bizen-Route` (profile), `X-Bizen-Route-P` (probability),
    `X-Bizen-Route-Fallback` (why the default was used), `X-Bizen-Route-Served` (a different profile was
    kept because other requests were in flight).
@@ -81,7 +81,25 @@ below the field says whether weights plus working memory fit on one card. Kev lo
 
 Rules: the loaded profile is only replaced when no other request is in flight; a switch costs a model
 load (about a minute). If Kev is unsure (below the minimum probability) or unavailable, the default
-profile is used. Requests whose `model` is not the alias are never routed.
+profile is used. Requests whose `model` is not the alias are never routed (see Model names for what they do instead).
+
+## Model names (the `model` field picks the profile)
+
+Applies to `POST /v1/chat/completions`, `/v1/completions` and `/v1/embeddings` with a JSON body; everything else is unchanged. Matching is exact and case sensitive.
+
+| `model` | what happens |
+|---|---|
+| a profile name | that profile serves the request (forwarded unchanged; the child's `--alias` is the profile name) |
+| `auto` (the router alias) | router on: Kev picks (see Router). Router off: whatever is loaded or loading; if nothing is, the `active_profile` starts. It never switches away from a loaded profile. |
+| missing, empty or not a string | like `auto` without the router (never wakes Kev) |
+| anything else | `404` `model_not_found` listing the available names (`strict_model_names: true`, the default); `false` serves it like `auto` |
+
+Naming a profile that is not the loaded one:
+- nothing else is in flight: stop the loaded profile and start the named one;
+- other requests are in flight, or another profile is still loading for someone: the request waits (polled every 0.5 s, off the lock) up to `switch_wait_s` (default 120, 0..1800), then switches if idle, else answers `503` `{"error":{"type":"busy","message":"busy: <loaded> is serving N request(s); retry later"}}` with `Retry-After: 30`. A running generation is never cut off and the wrong model is never served silently.
+- requests parked in that wait do not count as work, and a waiter never stops a profile that was just started for another request, so two clients asking for different profiles do not flip the model back and forth.
+
+Both keys are optional in `config.json` and editable in the Profiles tab, Behaviour. `GET /v1/models` always lists every profile name plus the alias (`auto`). Every proxied response carries `X-Bizen-Profile: <profile that served it>`. The Chat tab and `POST /api/chat` still use the active profile.
 
 ## Admin page tabs
 
