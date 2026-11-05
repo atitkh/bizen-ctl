@@ -90,12 +90,51 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_loadmap test_gen test_placement; do
+for U in test_loadmap test_gen test_placement test_system; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
   ok "$U exits 0" $([ $UR = 0 ] && echo 1 || echo 0)
 done
+echo "--- system tab: /api/system shape, auth, settings, token never echoed"
+curl -s -o /dev/null -w "%{http_code} " $B/api/system
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -d '{}' $B/api/system/settings
+curl -s -b "$T/jar" $B/api/system > "$T/sys.json"
+j2() { python3 -c "import sys,json;d=json.load(open('$T/sys.json'));$1"; }
+ok "system: top-level shape" $(j2 "print(int(all(k in d for k in ('os','kernel','python','hostname','cpu','ram','gpus','disks','tools'))))")
+ok "system: cpu/ram/tools shape" $(j2 "print(int(all(k in d['cpu'] for k in ('model','sockets','physical_cores','threads','allowed_cpus','numa_nodes','pinned_default')) and all(k in d['ram'] for k in ('total_mib','cgroup_limit_mib','nodes')) and all(k in d['tools'] for k in ('llama_server','numactl','taskset','nvidia_smi','hf_cli'))))")
+ok "system: llama-server version from the mock" $(j2 "print(int(d['tools']['llama_server']['executable'] and 'mock' in (d['tools']['llama_server']['version'] or '')))")
+ok "system: disks list download + model_dir + hf_home" $(j2 "print(int([x['role'] for x in d['disks']][:2]==['download','model_dir'] and d['disks'][0]['writable'] is True))")
+SEC="hf_SECRETtoken123456"
+echo "--- settings: reject relative path, bad endpoint, non-executable llama-server, bad free space"
+for P in '{"download_dir":"rel"}' '{"hf_endpoint":"ftp://x"}' "{\"llama_server\":\"$T/model.gguf\"}" '{"min_free_gib_for_download":-3}' '{"model_dirs":[]}'; do
+  curl -s -b "$T/jar" -o /dev/null -w "%{http_code} " -X POST -d "$P" $B/api/system/settings
+done; echo
+echo "--- settings: dry run (Check) saves nothing"
+curl -s -b "$T/jar" -X POST -d "{\"dry_run\":true,\"download_dir\":\"$T/dl-check\",\"hf_token\":\"$SEC\"}" $B/api/system/settings | j "print(d['ok'],'saved=',d['saved'])"
+ok "dry run created nothing" $([ ! -e "$T/dl-check" ] && echo 1 || echo 0)
+ok "dry run kept no token" $(! grep -q "$SEC" "$T/config.json" && echo 1 || echo 0)
+echo "--- settings: save (token + paths); model keeps running"
+STATE0=$(curl -s -b "$T/jar" $B/api/status | j "print(d['server']['state'],d['server']['pid'])")
+curl -s -b "$T/jar" -X POST -d "{\"download_dir\":\"$T/dl\",\"hf_token\":\"$SEC\",\"hf_endpoint\":\"https://hub.example/\",\"min_free_gib_for_download\":3,\"model_dirs\":[\"$T\",\"$T/second\"],\"llama_server\":\"$D/test/mock-llama-server.py\"}" $B/api/system/settings > "$T/set.json"
+j3() { python3 -c "import sys,json;d=json.load(open('$T/set.json'));$1"; }
+ok "settings saved, has_hf_token true, endpoint normalized" $(j3 "s=d['settings'];print(int(d['saved'] and s['has_hf_token'] and s['hf_endpoint']=='https://hub.example' and s['min_free_gib_for_download']==3 and s['model_dirs'][1].endswith('/second')))")
+ok "download_dir created" $([ -d "$T/dl" ] && echo 1 || echo 0)
+ok "saving settings did not restart the model" $([ "$STATE0" = "$(curl -s -b "$T/jar" $B/api/status | j "print(d['server']['state'],d['server']['pid'])")" ] && echo 1 || echo 0)
+ok "token stored in config.json (mode 600)" $(grep -q "$SEC" "$T/config.json" && [ "$(stat -c %a "$T/config.json")" = 600 ] && echo 1 || echo 0)
+curl -s -b "$T/jar" $B/api/config > "$T/cfg-get.json"; curl -s -b "$T/jar" $B/api/system > "$T/sys.json"
+ok "token not in GET /api/config, /api/system, /api/status, /api/metrics, settings reply" $(! cat "$T/cfg-get.json" "$T/sys.json" "$T/set.json" <(curl -s -b "$T/jar" $B/api/status) <(curl -s -b "$T/jar" $B/api/metrics) | grep -q "$SEC" && echo 1 || echo 0)
+ok "GET /api/config says has_hf_token only" $(python3 -c "import json;d=json.load(open('$T/cfg-get.json'));print(int(d['has_hf_token'] is True and 'hf_token' not in d))")
+ok "token not in controller log" $(! grep -q "$SEC" "$T/ctl.log" && echo 1 || echo 0)
+echo "--- settings: PUT /api/config round trip keeps the token; empty token keeps it; clear removes it"
+python3 -c "import json;d=json.load(open('$T/cfg-get.json'));d['profiles'][0]['ctx']=16384;print(json.dumps(d))" > "$T/new2.json"
+curl -s -b "$T/jar" -X PUT --data @"$T/new2.json" $B/api/config | j "print(d['ok'])"
+ok "PUT /api/config keeps the token" $(grep -q "$SEC" "$T/config.json" && ! grep -q has_hf_token "$T/config.json" && echo 1 || echo 0)
+curl -s -b "$T/jar" -X POST -d '{"hf_token":"","min_free_gib_for_download":4}' $B/api/system/settings > /dev/null
+ok "empty token keeps the saved one" $(grep -q "$SEC" "$T/config.json" && echo 1 || echo 0)
+curl -s -b "$T/jar" -X POST -d '{"clear_hf_token":true}' $B/api/system/settings | j "print(d['settings']['has_hf_token'])"
+ok "clear removes the token" $(! grep -q "$SEC" "$T/config.json" && echo 1 || echo 0)
+ok "model still the same process after all settings saves" $([ "$STATE0" = "$(curl -s -b "$T/jar" $B/api/status | j "print(d['server']['state'],d['server']['pid'])")" ] && echo 1 || echo 0)
 echo "--- status.mem has the extended fields"
 curl -s -b "$T/jar" $B/api/status | j "m=d['mem'];print('mem ok' if all(k in m for k in ('total_mib','available_mib','used_mib','free_mib','buffers_mib','cached_mib','swap_used_mib','nodes','child')) and m['used_mib']==m['total_mib']-m['available_mib'] else 'mem MISSING: '+str(sorted(m)))" | tee "$T/o"
 ok "status.mem extended" $(grep -q "^mem ok" "$T/o" && echo 1 || echo 0)

@@ -719,7 +719,7 @@ def system_info(cfg):
         except Exception:  # noqa: BLE001
             return default
     import platform
-    ci = parse_cpuinfo(read("/proc/cpuinfo"))
+    ci = safe(lambda: parse_cpuinfo(read("/proc/cpuinfo")), {"model": None, "threads": None, "sockets": None})
     allowed, sockets, _ = safe(cpu_topology, ([], {}, {}))
     cores = sum(len(v) for v in sockets.values()) or None
     pin_cpus, pin_node = safe(auto_pin, ([], None))
@@ -738,7 +738,7 @@ def system_info(cfg):
         disks.append({"path": path, "role": role, "free_gib": du.get("free_gib"), "total_gib": du.get("total_gib"),
                       "writable": du.get("writable"), "exists": du.get("exists")})
     return {
-        "os": os_pretty_name(read("/etc/os-release")) or safe(platform.platform, None),
+        "os": safe(lambda: os_pretty_name(read("/etc/os-release")), None) or safe(platform.platform, None),
         "kernel": safe(lambda: platform.release(), None), "python": safe(platform.python_version, None),
         "hostname": safe(platform.node, None),
         "cpu": {"model": ci["model"], "sockets": ci["sockets"] or (len(sockets) or None),

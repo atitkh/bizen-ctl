@@ -3,6 +3,8 @@
 import json, os, sys, threading, time, http.server, socketserver
 
 args = sys.argv[1:]
+if "--version" in args:      # like llama.cpp: version text on stderr, exit 0
+    print("version: 1234 (mock)", file=sys.stderr); sys.exit(0)
 opt = lambda k, d=None: args[args.index(k) + 1] if k in args else d
 port, key = int(opt("--port")), opt("--api-key")
 print("mock llama-server args:", " ".join(args), flush=True)

@@ -79,7 +79,7 @@ The page at `/` is a tabbed dashboard; the selected tab is kept in the URL hash 
 
 - **Dashboard**: KPIs, per-GPU cards (memory bar plus a 5-minute util/memory sparkline; blue = this server's GPUs), a RAM panel (stacked used / cache / free bars for the container and for each NUMA node, 10-minute sparkline, llama-server RSS and bytes read from disk), a CPU grid (one cell per core, pinned cores outlined) and the generation state. Charts are inline SVG fed by `/api/metrics`.
 - **Chat**: streaming chat against the running profile (system prompt, max tokens, temperature, time-to-first-token and live tok/s, Stop, Clear). A cold model shows a "loading, first start can take minutes" banner.
-- **Profiles**: profile editor and Behaviour. **Kev**: router settings and router test. **Logs**: llama-server log. **Access**: API keys, admin password, endpoints.
+- **Profiles**: profile editor and Behaviour. **Kev**: router settings and router test. **Logs**: llama-server log. **System**: detected hardware and portable settings (see below). **Access**: API keys, admin password, endpoints.
 
 RAM note: "available" counts reclaimable page cache, and an mmap'd model *is* page cache, so it barely moves while a model loads or runs. The KPI therefore shows used (total - available) / total, and the RAM panel splits used from cache, per NUMA node (read from `/sys/devices/system/node`, which is host-wide even inside LXD, unlike lxcfs's `/proc/meminfo`).
 
@@ -96,6 +96,39 @@ RAM note: "available" counts reclaimable page cache, and an mmap'd model *is* pa
 - `GET /api/status` gained `server.load` = `{phase, bytes_read, bytes_total, pct, eta_s, mbps}` (shard-aware model size; `bytes_read` from the child's `/proc/<pid>/io` `rchar`, which is what `--load-mode none` does, with an RSS-growth fallback for mmap; `pct` is monotonic and capped at 99 until ready) and `server.gen` = `{active, tokens, ttft_s, tps, last_tps}`. Both are also on every `/api/metrics` sample.
 - `GET /api/loadmap` (login required): `{profile, state, layers_total, layers_offloaded, devices:[{name, weights_mib, kv_mib, compute_mib}], cpu_mib, per_layer:[{layer, device}], fit:{raw:[...]}}` parsed from the startup log. Every pattern is optional, so a build that prints less just gives fewer fields. `test/fixtures/startup-q3.log` is a SYNTHETIC illustration of llama.cpp's format, not a real log; replace it with a real startup log when you have one.
 - Not verified on the real box: llama.cpp's actual log wording for this build, `rchar` behaviour on the NAS mount, browser rendering.
+
+## System tab and portability
+
+The **System** tab (`#system`, between Logs and Access) shows what bizen-ctl detected on the machine and holds the
+paths and defaults that used to be fixed to the original box. Everything is optional: a `config.json` without any
+of the keys below behaves exactly as before.
+
+- Hardware (`GET /api/system`, admin login): OS/kernel/Python/hostname, CPU model, sockets, physical cores, threads, the CPUs
+  this process may use, NUMA nodes (cpus, memory) and the default pin; RAM total, container limit and per-node memory;
+  GPUs (name, VRAM, driver, compute capability, CUDA version when `nvidia-smi` reports it); free space for the download dir,
+  model dirs and HF cache; tools (`llama-server` path, executable flag and `--version`, cached 60 s; `numactl`, `taskset`,
+  `nvidia-smi`, `hf`/`huggingface-cli`). Anything that cannot be read is `null` and shows as "–". Every probe has a 3 s timeout.
+  "Rescan hardware" re-reads it.
+- Settings (`POST /api/system/settings`, same persistence as `PUT /api/config`: lock, `config.json.bak`, mode 600). Send only the
+  keys you want to change. `"dry_run": true` validates without saving (the UI's Check button). Saving never restarts a running
+  model, and changing `llama_server` or `model_dirs` does not flag a restart.
+
+| key | default | notes |
+|---|---|---|
+| `download_dir` | `""` = first `model_dirs` entry | absolute; created if missing and proven writable with a temp file |
+| `model_dirs` | `["/srv/fs/models"]` | absolute; a missing dir only warns |
+| `kev.hf_home` | `"/srv/fs/hf"` | the HF cache; editable on the System tab as "Hugging Face cache" |
+| `llama_server` | `~/llama.cpp/build/bin/llama-server` | must be an executable file; a failing `--version` only warns |
+| `hf_endpoint` | `https://huggingface.co` | http(s) URL, e.g. a mirror |
+| `hf_token` | `""` | write-only: `GET /api/config` and `/api/system` return `has_hf_token` only. An empty or omitted token keeps the saved one; `"clear_hf_token": true` removes it |
+| `min_free_gib_for_download` | `20` | used by the download stages that build on this tab |
+| `gpu_bucket_mib` | `512` | `auto:N` ranks GPUs by used VRAM in buckets of this size; ties go to the highest index |
+| `gpu_fallback_count` | `8` | GPU indices assumed for `auto:N` when `nvidia-smi` is missing |
+| `download_mbps` | `11.7` | only the "about N min" estimate in the Kev hint |
+
+The Kev fit hint now uses the VRAM of the GPU Kev runs on (else the explicit `kev.gpus`, else the smallest GPU llama-server is not using)
+and says "GPU size unknown" instead of guessing when `nvidia-smi` gives nothing. Not verified on the real box: the exact `nvidia-smi`
+fields on driver 535 and browser rendering of the tab.
 
 ## Notes
 
