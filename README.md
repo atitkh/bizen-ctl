@@ -185,6 +185,8 @@ The Kev fit hint now uses the VRAM of the GPU Kev runs on (else the explicit `ke
 and says "GPU size unknown" instead of guessing when `nvidia-smi` gives nothing. Not verified on the real box: the exact `nvidia-smi`
 fields on driver 535 and browser rendering of the tab.
 
+- **Context window for clients:** `GET /v1/models` includes `context_length` and `max_model_len` for every profile (its `ctx` setting) and for `auto` (the profile `auto` would serve: the loaded or loading one, else the active profile). `GET /props` answers llama-server-style `n_ctx` / `default_generation_settings.n_ctx` from config and never starts a model, so a client that probes it (OpenClaw discovery) cannot trigger a load. Both need the API key.
+
 ## Notes
 
 - llama-server itself listens only on 127.0.0.1 with a random internal key. All outside access goes through the controller.

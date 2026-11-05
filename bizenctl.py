@@ -2217,6 +2217,28 @@ class SSECount:
 
 # ---------------------------------------------------------------- supervisor
 
+def profile_contexts(cfg, sup):
+    """{profile name: ctx} for every profile, plus the router alias ('auto') mapped to the context of the profile
+    'auto' would serve right now: the loaded/loading one, else the configured active profile. Never raises."""
+    try:
+        out = {}
+        for p in cfg.get("profiles") or []:
+            c = p.get("ctx")
+            if isinstance(c, int) and not isinstance(c, bool) and c > 0:
+                out[p["name"]] = c
+        cur = None
+        try:
+            cur = sup.serving()
+        except Exception:  # noqa: BLE001
+            cur = None
+        cur = cur if cur in out else cfg.get("active_profile")
+        if cur in out:
+            out[cfg.get("router")["alias"]] = out[cur]
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def resolve_model(model, names, alias, router_enabled, strict):
     """Pure: map a request's model field to what the proxy should do.
     ("profile", name) | ("router", None) | ("auto", None) | ("unknown", name).
@@ -3725,9 +3747,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sup, router = self.sup, self.server.router
         path = urllib.parse.urlsplit(self.path).path
         if path == "/v1/models" and method == "GET":
-            ids = [p["name"] for p in self.cfg.get("profiles")] + [self.cfg.get("router")["alias"]]
+            ctxs = profile_contexts(self.cfg, sup)
+            alias = self.cfg.get("router")["alias"]
+            ids = [p["name"] for p in self.cfg.get("profiles")] + [alias]
             return self.send_json({"object": "list", "data": [
-                {"id": i, "object": "model", "owned_by": "bizen-ctl"} for i in ids]})
+                dict({"id": i, "object": "model", "owned_by": "bizen-ctl"},
+                     **({"context_length": ctxs[i], "max_model_len": ctxs[i]} if ctxs.get(i) else {}))
+                for i in ids]})
+        if path == "/props" and method == "GET":
+            # llama-server style, answered here without starting anything: clients that probe /props
+            # (OpenClaw discovery) must not trigger a model load.
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            ctxs = profile_contexts(self.cfg, sup)
+            name = (q.get("model") or [self.cfg.get("router")["alias"]])[0]
+            n = ctxs.get(name) or ctxs.get(self.cfg.get("router")["alias"])
+            return self.send_json({"n_ctx": n, "default_generation_settings": {"n_ctx": n},
+                                   "model_alias": name, "bizen_ctl": True})
         if path == "/v1/route" and method == "POST":
             return self.route_endpoint()
         body = self.body()

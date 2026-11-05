@@ -373,6 +373,15 @@ req4() { # model [extra json]: prints "<code> <X-Bizen-Profile>"
   echo " $(grep -i '^x-bizen-profile' "$T/hh" | tr -d '\r' | awk '{print $2}')"; }
 ok "/v1/models lists every profile + auto (router disabled)" $(curl -s "${K4[@]}" $B4/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);i=[m['id'] for m in d['data']];print(int(i==['qwen36-2gpu','qwen36-1gpu','auto'] and all(m['owned_by']=='bizen-ctl' for m in d['data'])))")
 ok "/v1/models needs the API key" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B4/v1/models)" = 401 ] && echo 1 || echo 0)
+echo "--- context window: /v1/models fields and a /props that never starts a model"
+ST0=$(H4 $B4/api/status | python3 -c "import sys,json;print(json.load(sys.stdin)['server']['state'])")
+curl -s "${K4[@]}" $B4/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print('ctxmodels', all(isinstance(m.get('context_length'),int) and m['context_length']==m.get('max_model_len') for m in d), len(d))" | tee "$T/o"
+ok "/v1/models: every entry (profiles + auto) has context_length == max_model_len" $(grep -q "^ctxmodels True" "$T/o" && echo 1 || echo 0)
+curl -s "${K4[@]}" $B4/props | python3 -c "import sys,json;d=json.load(sys.stdin);print('props', d['n_ctx']==d['default_generation_settings']['n_ctx'] and d['n_ctx']>0)" | tee "$T/o"
+ok "/props answers n_ctx for auto" $(grep -q "^props True" "$T/o" && echo 1 || echo 0)
+ok "/props needs the API key" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B4/props)" = 401 ] && echo 1 || echo 0)
+ST1=$(H4 $B4/api/status | python3 -c "import sys,json;print(json.load(sys.stdin)['server']['state'])")
+ok "/v1/models and /props did not start a model (state stayed $ST0)" $([ "$ST0" = "stopped" ] && [ "$ST1" = "stopped" ] && echo 1 || echo 0)
 R=$(req4 '"model":"qwen36-1gpu",'); echo "cold named: $R"
 ok "named profile from cold starts that profile (X-Bizen-Profile)" $([ "$R" = "200 qwen36-1gpu" ] && echo 1 || echo 0)
 R=$(req4 '"model":"qwen36-2gpu",'); echo "named switch: $R"

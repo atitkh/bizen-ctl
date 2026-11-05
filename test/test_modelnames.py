@@ -128,5 +128,24 @@ check("switch_wait_s 0 and 1800 accepted", v(switch_wait_s=0) and v(switch_wait_
 check("switch_wait_s -1, 1801, 'x', 1.5, true, null rejected", not any(v(switch_wait_s=x) for x in (-1, 1801, "x", 1.5, True, None)))
 check("strict_model_names bool accepted, others rejected", v(strict_model_names=False) and not any(v(strict_model_names=x) for x in ("yes", 1, None)))
 
+# profile_contexts: per-profile ctx + 'auto' = the ctx of the profile auto would serve
+class _Cfg(dict):
+    pass
+cfgc = _Cfg(profiles=[{"name": "a", "ctx": 32768}, {"name": "b", "ctx": 16384}, {"name": "c", "ctx": None}, {"name": "d", "ctx": True}],
+            active_profile="a", router={"alias": "auto"})
+cfgc.get = lambda k, d=None, _c=dict(cfgc): _c.get(k, d)
+class _Sup:
+    def __init__(self, cur): self.cur = cur
+    def serving(self): return self.cur
+pc = b.profile_contexts(cfgc, _Sup(None))
+check("profile_contexts: valid ints only (None and bool skipped)", pc.get("a") == 32768 and pc.get("b") == 16384 and "c" not in pc and "d" not in pc)
+check("auto = active profile's ctx when nothing is loaded", pc.get("auto") == 32768)
+check("auto = loaded profile's ctx when one is loaded", b.profile_contexts(cfgc, _Sup("b")).get("auto") == 16384)
+check("auto ignores an unknown loaded name, falls back to active", b.profile_contexts(cfgc, _Sup("zzz")).get("auto") == 32768)
+class _Boom:
+    def serving(self): raise RuntimeError("x")
+check("profile_contexts never raises (supervisor error)", b.profile_contexts(cfgc, _Boom()).get("auto") == 32768)
+check("profile_contexts never raises (garbage cfg)", b.profile_contexts(None, None) == {})
+
 print("FAILED: %d" % len(fails) if fails else "ALL PASSED")
 sys.exit(1 if fails else 0)
