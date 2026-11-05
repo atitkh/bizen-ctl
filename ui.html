@@ -135,6 +135,7 @@
     <a href="#profiles" data-tab="profiles">Profiles</a>
     <a href="#kev" data-tab="kev">Kev</a>
     <a href="#logs" data-tab="logs">Logs</a>
+    <a href="#system" data-tab="system">System</a>
     <a href="#access" data-tab="access">Access</a>
   </nav>
   <div class="pane" id="pane-dashboard" data-tab="dashboard">
@@ -324,6 +325,31 @@
     <div id="logs"><pre id="logtext"></pre></div>
   </section>
 
+  </div>
+  <div class="pane" id="pane-system" data-tab="system">
+  <section class="wide">
+    <h2>Hardware <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0" id="sysAge"></span><button id="sysRescan" onclick="loadSystem(true)">Rescan hardware</button></h2>
+    <div class="note" id="sysHost" style="margin-bottom:10px">–</div>
+    <div id="sysCpu" class="gpugrid"></div>
+  </section>
+  <section class="wide"><h2>GPUs</h2><div id="sysGpus" class="gpugrid"></div></section>
+  <section class="wide"><h2>Disks</h2><div id="sysDisks" class="gpugrid"></div></section>
+  <section class="wide"><h2>Tools</h2><div id="sysTools" class="chips"></div></section>
+  <section class="wide">
+    <h2>Settings <span class="sp"></span><span class="note" style="text-transform:none;letter-spacing:0">saved to config.json; nothing here restarts a running model</span></h2>
+    <div class="grid2">
+      <div><label>Download directory <span class="note">(empty = first model directory)</span></label><input id="sDl" class="key" placeholder="/path/for/downloads"></div>
+      <div><label>Hugging Face cache (<code>HF_HOME</code>, used by Kev)</label><input id="sHf" class="key" placeholder="empty = ~/.cache/huggingface"></div>
+      <div style="grid-column:1/-1"><label>Model directories</label><div id="sDirs"></div><div class="row" style="margin-top:6px"><button onclick="sysAddDir()">Add directory</button></div></div>
+      <div style="grid-column:1/-1"><label>llama-server path</label>
+        <div class="row"><input id="sLs" class="key" style="flex:1" placeholder="/path/to/llama-server"><button onclick="sysSave(true)" title="validate without saving">Check</button></div></div>
+      <div><label>Hugging Face endpoint</label><input id="sEp" class="key" placeholder="https://huggingface.co"></div>
+      <div><label>Minimum free space for a download (GiB)</label><input id="sMin" type="number" min="0" step="1"></div>
+      <div style="grid-column:1/-1"><label>Hugging Face token <span class="pill" id="sTokPill" style="font-size:11px;margin-left:6px">–</span></label>
+        <div class="row"><input id="sTok" type="password" autocomplete="new-password" style="flex:1" placeholder="paste a token to set or replace it (write-only, never shown)"><button class="danger" id="sTokClear" onclick="sysClearToken()">Clear token</button></div></div>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="primary" onclick="sysSave(false)">Save settings</button><span class="note" id="sCheckOut"></span></div>
+  </section>
   </div>
   <div class="pane" id="pane-access" data-tab="access">
   <section>
@@ -682,7 +708,7 @@ async function loadModels() {
 }
 async function init() {
   try { await loadConfig(); } catch { return; }
-  loadModels(); loadKevPresets(); refresh(); refreshLogs();
+  loadModels(); loadKevPresets(); loadSystem(false); refresh(); refreshLogs();
   $('logs').scrollTop = 1e9;
   if (!window._timers) window._timers = [setInterval(() => { if (!document.hidden) refresh(); }, 2000),
     setInterval(() => { if (!document.hidden && (curTab === 'logs' || curTab === 'kev')) refreshLogs(); }, 2000)];
@@ -1043,8 +1069,111 @@ async function chatSend() {
 }
 $('chatIn').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); chatSend(); } });
 
+/* ---- System tab: hardware, tools, portable settings (GET /api/system, POST /api/system/settings) ---- */
+let sysDirs = [], sysLoaded = false, sysFormDirty = false;
+const dash = v => (v == null || v === '' ? '–' : v);
+function sysBar(used, total, cls) {
+  const pct = total ? Math.max(0, Math.min(100, 100 * used / total)) : 0;
+  return `<div class="bar"><i style="width:${pct.toFixed(1)}%;${cls || ''}"></i></div>`;
+}
+function sysChip(label, state, title) {
+  const col = state === 'ok' ? 'var(--ok)' : state === 'warn' ? 'var(--warn)' : 'var(--dim)';
+  return `<span class="chip" title="${esc(title || '')}" style="color:${col};border-color:${col}"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${col};margin-right:6px"></span>${esc(label)}</span>`;
+}
+function renderSystem() {
+  const s = sysInfo; if (!s) return;
+  const c = s.cpu || {}, r = s.ram || {};
+  $('sysHost').textContent = [s.hostname, s.os, s.kernel && 'kernel ' + s.kernel, s.python && 'python ' + s.python].filter(Boolean).join('  ·  ') || '–';
+  $('sysAge').textContent = s.ts ? 'scanned ' + new Date(s.ts * 1000).toLocaleTimeString() : '';
+  const nodes = (c.numa_nodes || []);
+  const cpuCard = `<div class="gcard"><div class="hd"><b>CPU</b><span>${esc(dash(c.sockets))} socket${c.sockets === 1 ? '' : 's'}</span></div>
+    <div style="font-size:12.5px">${esc(dash(c.model))}</div>
+    <div class="ft"><span>${esc(dash(c.physical_cores))} physical cores (allowed) · ${esc(dash(c.threads))} threads</span></div>
+    <div class="ft"><span>allowed CPUs: ${(c.allowed_cpus || []).length ? esc(c.allowed_cpus.join(',')) : '–'}</span></div>
+    <div class="ft"><span>auto-pin: ${c.pinned_default && (c.pinned_default.cpus || []).length ? esc(c.pinned_default.cpus.join(',')) + (c.pinned_default.node != null ? ' (node ' + c.pinned_default.node + ')' : '') : '–'}</span></div></div>`;
+  const ramNodes = (r.nodes || []);
+  const ramCard = `<div class="gcard"><div class="hd"><b>RAM</b><span>${r.total_mib != null ? gib(r.total_mib) + ' GiB' : '–'}${r.cgroup_limit_mib ? ' · container limit ' + gib(r.cgroup_limit_mib) + ' GiB' : ''}</span></div>
+    ${ramNodes.length ? ramNodes.map(n => `<div style="margin-top:6px"><div class="ft" style="margin:0 0 3px"><span>NUMA node ${n.node}${(nodes.find(x => x.id === n.node) || {}).cpus ? ' · cpus ' + esc(nodes.find(x => x.id === n.node).cpus.join(',')) : ''}</span><span>${gib(n.used_mib)} / ${gib(n.total_mib)} GiB used</span></div>${sysBar(n.used_mib, n.total_mib)}</div>`).join('')
+      : (r.total_mib != null ? `<div class="note" style="margin-top:6px">no per-node data (single node or not exposed)</div>` : '<div class="note">unknown</div>')}</div>`;
+  $('sysCpu').innerHTML = cpuCard + ramCard;
+  const live = (status && status.gpus) || [], inUse = new Set(((status && status.server && status.server.gpus) || []));
+  const g = s.gpus || [];
+  $('sysGpus').innerHTML = g.length ? g.map(x => {
+    const lv = live.find(l => l.index === x.index), used = lv ? lv.mem_used : null;
+    return `<div class="gcard ${inUse.has(x.index) ? 'mine' : ''}"><div class="hd"><span><span class="idx">GPU ${x.index}</span> ${esc(dash(x.name))}</span><span>${x.vram_mib != null ? gib(x.vram_mib) + ' GiB' : '–'}</span></div>
+      ${x.vram_mib && used != null ? sysBar(used, x.vram_mib) + `<div class="ft"><span>${gib(used)} GiB used now</span><span>${(100 * used / x.vram_mib).toFixed(0)}%</span></div>` : sysBar(0, 1) + '<div class="ft"><span>usage unknown</span></div>'}
+      <div class="ft"><span>driver ${esc(dash(x.driver))}${x.cuda ? ' · CUDA ' + esc(x.cuda) : ''}</span><span>compute ${esc(dash(x.compute_cap))}</span></div></div>`;
+  }).join('') : '<div class="note">No NVIDIA GPU detected (nvidia-smi missing or not responding). CPU-only profiles still work.</div>';
+  const roles = { download: 'Download dir', model_dir: 'Model dir', hf_home: 'HF cache' };
+  const d = s.disks || [];
+  $('sysDisks').innerHTML = d.length ? d.map(x => {
+    const used = x.total_gib != null && x.free_gib != null ? x.total_gib - x.free_gib : null, low = x.free_gib != null && x.free_gib < Number((s.settings || {}).min_free_gib_for_download || 0);
+    return `<div class="gcard"><div class="hd"><b>${roles[x.role] || esc(x.role)}</b><span>${x.writable === false ? '<span style="color:var(--warn)">not writable</span>' : x.writable ? 'writable' : '–'}${x.exists === false ? ' · <span style="color:var(--warn)">missing</span>' : ''}</span></div>
+      <div class="key" style="font-size:12px;word-break:break-all">${esc(x.path)}</div>
+      ${used != null ? sysBar(used, x.total_gib, low ? 'background:var(--warn)' : '') : sysBar(0, 1)}
+      <div class="ft"><span>${x.free_gib != null ? x.free_gib + ' GiB free' : 'free space unknown'}</span><span>${x.total_gib != null ? x.total_gib + ' GiB total' : ''}</span></div></div>`;
+  }).join('') : '<div class="note">–</div>';
+  const t = s.tools || {}, ls = t.llama_server || {};
+  const lsState = ls.executable ? (ls.version ? 'ok' : 'warn') : (ls.exists ? 'warn' : 'none');
+  $('sysTools').innerHTML = [
+    sysChip('llama-server ' + (ls.path ? ls.path : '(not set)') + (ls.version ? ' · ' + ls.version : ls.executable ? ' · version unknown' : ls.exists ? ' · not executable' : ' · not found'), lsState, ls.path || ''),
+    sysChip('numactl', t.numactl ? 'ok' : 'none', t.numactl || 'not installed: pinning falls back to taskset, no memory binding'),
+    sysChip('taskset', t.taskset ? 'ok' : 'none', t.taskset || 'not installed'),
+    sysChip('nvidia-smi', t.nvidia_smi ? 'ok' : 'none', t.nvidia_smi || 'not installed: GPU info unavailable'),
+    sysChip('Hugging Face CLI', t.hf_cli ? 'ok' : 'none', t.hf_cli ? 'hf / huggingface-cli found' : 'not installed (optional)'),
+  ].join('');
+  if (!sysFormDirty) fillSysForm();
+  else $('sTokPill').textContent = (s.settings || {}).has_hf_token ? 'token set' : 'no token';
+}
+function fillSysForm() {
+  const st = (sysInfo && sysInfo.settings) || {};
+  $('sDl').value = st.download_dir || ''; $('sDl').placeholder = st.effective_download_dir ? 'default: ' + st.effective_download_dir : '/path/for/downloads';
+  $('sHf').value = st.hf_home || ''; $('sLs').value = st.llama_server || '';
+  $('sEp').value = st.hf_endpoint || ''; $('sMin').value = st.min_free_gib_for_download ?? '';
+  sysDirs = (st.model_dirs || []).slice(); renderSysDirs();
+  $('sTok').value = ''; $('sTokPill').textContent = st.has_hf_token ? 'token set' : 'no token';
+  $('sTokPill').style.color = st.has_hf_token ? 'var(--ok)' : 'var(--dim)'; $('sTokClear').disabled = !st.has_hf_token;
+  sysFormDirty = false;
+}
+function renderSysDirs() {
+  $('sDirs').innerHTML = sysDirs.map((d, i) => `<div class="row" style="margin-bottom:4px"><input class="key" style="flex:1" value="${esc(d)}" oninput="sysDirs[${i}]=this.value;sysFormDirty=true"><button onclick="sysRmDir(${i})" title="remove">✕</button></div>`).join('')
+    || '<div class="note">none (at least one is required to save)</div>';
+}
+function sysAddDir() { sysDirs.push(''); sysFormDirty = true; renderSysDirs(); }
+function sysRmDir(i) { sysDirs.splice(i, 1); sysFormDirty = true; renderSysDirs(); }
+async function loadSystem(manual) {
+  const b = $('sysRescan'); if (manual) { b.disabled = true; b.textContent = 'Scanning…'; }
+  try { sysInfo = await api('/api/system'); sysLoaded = true; renderSystem(); kevHint(); if (manual) toast('Hardware rescanned'); }
+  catch (e) { if (manual && e.message !== 'login') toast('Rescan failed: ' + e.message, true); $('sysAge').textContent = 'unavailable'; }
+  finally { b.disabled = false; b.textContent = 'Rescan hardware'; }
+}
+function sysPayload() {
+  const p = { download_dir: $('sDl').value.trim(), hf_home: $('sHf').value.trim(), model_dirs: sysDirs.map(x => x.trim()).filter(Boolean),
+    llama_server: $('sLs').value.trim(), hf_endpoint: $('sEp').value.trim(), min_free_gib_for_download: $('sMin').value === '' ? 20 : Number($('sMin').value) };
+  const tok = $('sTok').value.trim(); if (tok) p.hf_token = tok;
+  return p;
+}
+async function sysSave(dry) {
+  const out = $('sCheckOut'); out.style.color = ''; out.textContent = dry ? 'checking…' : 'saving…';
+  try {
+    const r = await api('/api/system/settings', { method: 'POST', body: JSON.stringify({ ...sysPayload(), dry_run: !!dry }) });
+    const bits = [dry ? 'Check passed' : 'Saved'];
+    if (r.checks && r.checks.llama_server_version) bits.push('llama-server: ' + r.checks.llama_server_version);
+    (r.warnings || []).forEach(w => bits.push('warning: ' + w));
+    out.textContent = bits.join(' · '); out.style.color = (r.warnings || []).length ? 'var(--warn)' : 'var(--ok)';
+    if (!dry) { sysFormDirty = false; await loadConfig(); await loadSystem(false); loadModels(); toast('Settings saved'); }
+  } catch (e) { out.textContent = e.message; out.style.color = 'var(--bad)'; if (!dry && e.message !== 'login') toast(e.message, true); }
+}
+async function sysClearToken() {
+  if (!confirm('Remove the saved Hugging Face token?')) return;
+  try { await api('/api/system/settings', { method: 'POST', body: JSON.stringify({ clear_hf_token: true }) }); toast('Token cleared'); sysFormDirty = false; await loadSystem(false); }
+  catch (e) { toast(e.message, true); }
+}
+['sDl', 'sHf', 'sLs', 'sEp', 'sMin', 'sTok'].forEach(i => $(i).addEventListener('input', () => { sysFormDirty = true; }));
+tabHooks.system = { show() { if (!sysLoaded) loadSystem(false); } };
+
 /* ---- tabs: selected tab lives in location.hash ---- */
-const TABS = ['dashboard', 'chat', 'profiles', 'kev', 'logs', 'access'];
+const TABS = ['dashboard', 'chat', 'profiles', 'kev', 'logs', 'system', 'access'];
 function showTab(t) {
   if (!TABS.includes(t)) t = 'dashboard';
   if (t !== curTab && tabHooks[curTab] && tabHooks[curTab].hide) tabHooks[curTab].hide();
