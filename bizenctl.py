@@ -24,6 +24,7 @@ import signal
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -95,6 +96,10 @@ DEFAULTS = {
     "gpu_bucket_mib": 512,          # auto:N ranks GPUs by used VRAM in buckets of this size (ties go to the highest index)
     "gpu_fallback_count": 8,        # GPU indices assumed for auto:N when nvidia-smi is unavailable
     "download_mbps": 11.7,          # only used for the "about N min" download estimate in the Kev hint
+    "download_dir": "",             # "" = the first model_dirs entry
+    "hf_token": "",                 # write-only: never returned by the API
+    "hf_endpoint": "https://huggingface.co",
+    "min_free_gib_for_download": 20,
     "internal_port": 18081,
     "idle_ttl_min": 10,
     "keep_loaded": False,
@@ -240,13 +245,27 @@ class Config:
                 raise ValueError("every route needs a description")
             if r["default_profile"] not in names:
                 raise ValueError("router default_profile must be an existing profile")
+        if not str(d.get("hf_endpoint") or "").startswith(("http://", "https://")):
+            raise ValueError("hf_endpoint must be an http(s) URL")
+        if not isinstance(d["model_dirs"], list):
+            raise ValueError("model_dirs must be a list")
+        try:
+            if float(d["min_free_gib_for_download"]) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("min_free_gib_for_download must be a number >= 0") from None
         if not d["api_keys"]:
             raise ValueError("api_keys must contain at least one key")
         if not d["admin_password"]:
             raise ValueError("admin_password must be set")
 
-    def save(self, new):
+    def save(self, new, clear_token=False):
         d = self.normalize(new)
+        d.pop("has_hf_token", None)         # echoed by GET /api/config, never stored
+        if clear_token:
+            d["hf_token"] = ""
+        elif not d.get("hf_token"):
+            d["hf_token"] = self.data.get("hf_token", "")   # empty or omitted keeps the saved token
         self.validate(d)
         with self.lock:
             if os.path.exists(self.path):
@@ -525,6 +544,349 @@ def meminfo(pid=None):
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+# ---------------------------------------------------------------- system info (GET /api/system) and settings
+
+PROBE_TIMEOUT = 3          # seconds; every subprocess used for hardware/tool detection is capped at this
+
+
+def _run_probe(cmd, timeout=PROBE_TIMEOUT):
+    """stdout of a short probe command, or None on any failure (missing, timeout, non-zero exit)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def parse_cpulist(text):
+    """'0,8-9,13' -> [0, 8, 9, 13]; junk pieces are skipped."""
+    out = []
+    for part in str(text or "").strip().split(","):
+        part = part.strip()
+        try:
+            if "-" in part:
+                a, _, b = part.partition("-")
+                out.extend(range(int(a), int(b) + 1))
+            elif part:
+                out.append(int(part))
+        except ValueError:
+            continue
+    return sorted(set(out))
+
+
+def parse_cpuinfo(text):
+    """/proc/cpuinfo text -> {model, threads (processor entries), sockets (distinct physical ids, or None)}."""
+    model, procs, pkgs = None, 0, set()
+    for line in str(text or "").splitlines():
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if k == "model name" and model is None and v:
+            model = re.sub(r"\s+", " ", v)
+        elif k == "processor":
+            procs += 1
+        elif k == "physical id" and v.isdigit():
+            pkgs.add(int(v))
+    return {"model": model, "threads": procs or None, "sockets": len(pkgs) or None}
+
+
+def os_pretty_name(text):
+    for line in str(text or "").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip().strip('"') or None
+    return None
+
+
+def numa_nodes(root="/sys/devices/system/node"):
+    """[{id, cpus, mem_total_mib}] from sysfs; [] when there is no NUMA information."""
+    out = []
+    for path in glob.glob(os.path.join(root, "node[0-9]*")):
+        try:
+            idx = int(re.search(r"node(\d+)$", path).group(1))
+            m = _kb_map(re.sub(r"^Node\s+\d+\s+", "", read(os.path.join(path, "meminfo")), flags=re.M))
+            out.append({"id": idx, "cpus": parse_cpulist(read(os.path.join(path, "cpulist"))),
+                        "mem_total_mib": m.get("MemTotal")})
+        except Exception:  # noqa: BLE001
+            continue
+    return sorted(out, key=lambda n: n["id"])
+
+
+def parse_smi_gpus(text, with_cap=True):
+    """nvidia-smi csv (index,name,memory.total,driver_version[,compute_cap]) -> gpu dicts. Unknown fields are None."""
+    gpus = []
+    for line in str(text or "").strip().splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) < 4 or not p[0].isdigit():
+            continue
+        vram = int(float(p[2])) if re.fullmatch(r"[\d.]+", p[2]) else None
+        cap = p[4] if with_cap and len(p) > 4 and re.fullmatch(r"\d+\.\d+", p[4]) else None
+        gpus.append({"index": int(p[0]), "name": p[1] or None, "vram_mib": vram,
+                     "driver": p[3] or None, "compute_cap": cap})
+    return gpus
+
+
+def smi_cuda_version(text):
+    m = re.search(r"CUDA Version:\s*([\d.]+)", str(text or ""))
+    return m.group(1) if m else None
+
+
+def detect_gpus():
+    """GPU list with driver / compute capability / CUDA version where nvidia-smi can say; [] without nvidia-smi."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    q = "--query-gpu=index,name,memory.total,driver_version"
+    out = _run_probe(["nvidia-smi", q + ",compute_cap", "--format=csv,noheader,nounits"])
+    gpus = parse_smi_gpus(out, True) if out is not None else None
+    if gpus is None:        # older drivers reject the compute_cap field
+        gpus = parse_smi_gpus(_run_probe(["nvidia-smi", q, "--format=csv,noheader,nounits"]), False)
+    cuda = smi_cuda_version(_run_probe(["nvidia-smi"]))
+    for g in gpus:
+        if cuda:
+            g["cuda"] = cuda
+    return gpus
+
+
+def disk_usage(path):
+    """{free_gib, total_gib, writable, exists} for the nearest existing ancestor of path; unknown -> None."""
+    out = {"free_gib": None, "total_gib": None, "writable": None, "exists": False}
+    try:
+        p = os.path.expanduser(str(path))
+        out["exists"] = os.path.isdir(p)
+        while p and not os.path.exists(p) and os.path.dirname(p) != p:
+            p = os.path.dirname(p)
+        st = os.statvfs(p)
+        out["free_gib"] = round(st.f_bavail * st.f_frsize / 2**30, 1)
+        out["total_gib"] = round(st.f_blocks * st.f_frsize / 2**30, 1)
+        out["writable"] = os.access(p, os.W_OK | os.X_OK)
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def effective_download_dir(cfg):
+    d = str(cfg.get("download_dir") or "").strip()
+    if d:
+        return d
+    md = cfg.get("model_dirs") or []
+    return md[0] if md else ""
+
+
+def effective_hf_home(cfg):
+    h = str((cfg.get("kev") or {}).get("hf_home") or "").strip()
+    return h or "~/.cache/huggingface"
+
+
+_VERSION_CACHE = {}
+
+
+def tool_version(path, ttl=60, timeout=PROBE_TIMEOUT, now=None):
+    """First useful line of `<path> --version` (stdout+stderr, llama.cpp prints to stderr); cached `ttl` s per path."""
+    now = time.time() if now is None else now
+    hit = _VERSION_CACHE.get(path)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    ver = None
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=timeout)
+        txt = (r.stdout or "") + "\n" + (r.stderr or "")
+        if r.returncode == 0:
+            lines = [l.strip() for l in txt.splitlines() if l.strip()]
+            pick = [l for l in lines if re.search(r"version|build", l, re.I)] or lines
+            ver = pick[0][:200] if pick else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    _VERSION_CACHE[path] = (now, ver)
+    return ver
+
+
+def tools_info(cfg):
+    ls = os.path.expanduser(str(cfg.get("llama_server") or ""))
+    exists = bool(ls) and os.path.isfile(ls)
+    exe = exists and os.access(ls, os.X_OK)
+    ver = tool_version(ls) if exe else None
+    return {"llama_server": {"path": ls or None, "exists": exists, "executable": bool(exe), "version": ver},
+            "numactl": shutil.which("numactl"), "taskset": shutil.which("taskset"),
+            "nvidia_smi": shutil.which("nvidia-smi"),
+            "hf_cli": bool(shutil.which("hf") or shutil.which("huggingface-cli"))}
+
+
+def system_info(cfg):
+    """Everything GET /api/system returns, minus secrets. Never raises: each block degrades to None/[]."""
+    def safe(fn, default):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            return default
+    import platform
+    ci = parse_cpuinfo(read("/proc/cpuinfo"))
+    allowed, sockets, _ = safe(cpu_topology, ([], {}, {}))
+    cores = sum(len(v) for v in sockets.values()) or None
+    pin_cpus, pin_node = safe(auto_pin, ([], None))
+    mi = safe(meminfo, {})
+    cg = mi.get("cgroup") or {}
+    nodes = safe(numa_nodes, [])
+    gpus = safe(detect_gpus, [])
+    disks = []
+    seen = set()
+    for role, path in [("download", effective_download_dir(cfg))] + [("model_dir", d) for d in (cfg.get("model_dirs") or [])] \
+            + [("hf_home", effective_hf_home(cfg))]:
+        if not path or (role, path) in seen:
+            continue
+        seen.add((role, path))
+        du = safe(lambda p=path: disk_usage(p), {})
+        disks.append({"path": path, "role": role, "free_gib": du.get("free_gib"), "total_gib": du.get("total_gib"),
+                      "writable": du.get("writable"), "exists": du.get("exists")})
+    return {
+        "os": os_pretty_name(read("/etc/os-release")) or safe(platform.platform, None),
+        "kernel": safe(lambda: platform.release(), None), "python": safe(platform.python_version, None),
+        "hostname": safe(platform.node, None),
+        "cpu": {"model": ci["model"], "sockets": ci["sockets"] or (len(sockets) or None),
+                "physical_cores": cores, "threads": ci["threads"] or (len(allowed) or None),
+                "allowed_cpus": allowed, "numa_nodes": nodes,
+                "pinned_default": {"cpus": pin_cpus, "node": pin_node}},
+        "ram": {"total_mib": mi.get("total_mib"), "cgroup_limit_mib": cg.get("limit_mib"), "nodes": mi.get("nodes") or []},
+        "gpus": gpus, "disks": disks, "tools": safe(lambda: tools_info(cfg), {}),
+        "settings": public_settings(cfg),
+        "ts": time.time(),
+    }
+
+
+SETTING_KEYS = ("download_dir", "model_dirs", "hf_home", "llama_server", "hf_endpoint", "hf_token",
+                "clear_hf_token", "min_free_gib_for_download")
+
+
+def public_settings(cfg):
+    """The editable settings as the UI shows them. The token is never included, only whether one is set."""
+    return {"download_dir": cfg.get("download_dir") or "", "effective_download_dir": effective_download_dir(cfg),
+            "model_dirs": list(cfg.get("model_dirs") or []), "hf_home": (cfg.get("kev") or {}).get("hf_home") or "",
+            "llama_server": cfg.get("llama_server") or "", "hf_endpoint": cfg.get("hf_endpoint") or DEFAULTS["hf_endpoint"],
+            "has_hf_token": bool(cfg.get("hf_token")),
+            "min_free_gib_for_download": cfg.get("min_free_gib_for_download")}
+
+
+def public_config(data):
+    """Config for GET /api/config: the secret token is replaced by has_hf_token."""
+    d = dict(data)
+    d["has_hf_token"] = bool(d.pop("hf_token", ""))
+    return d
+
+
+def _abs_path(label, v, allow_empty=False):
+    v = str(v if v is not None else "").strip()
+    if not v:
+        if allow_empty:
+            return ""
+        raise ValueError(f"{label} is required")
+    if "\x00" in v or "\n" in v:
+        raise ValueError(f"{label} contains invalid characters")
+    if not os.path.isabs(os.path.expanduser(v)):
+        raise ValueError(f"{label} must be an absolute path")
+    return v
+
+
+def check_writable_dir(path, create):
+    """Prove a directory is writable by creating and removing a temp file. With create=False an absent
+    directory is judged by its nearest existing ancestor and nothing is created. Raises ValueError."""
+    p = os.path.expanduser(path)
+    target = p
+    if not os.path.isdir(p):
+        if os.path.exists(p):
+            raise ValueError(f"{path} exists and is not a directory")
+        if create:
+            try:
+                os.makedirs(p, exist_ok=True)
+            except OSError as e:
+                raise ValueError(f"cannot create {path}: {e.strerror or e}") from None
+        else:
+            while not os.path.isdir(target) and os.path.dirname(target) != target:
+                target = os.path.dirname(target)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".bizen-write-test-", dir=target)
+        os.close(fd)
+        os.remove(tmp)
+    except OSError as e:
+        raise ValueError(f"{path} is not writable: {e.strerror or e}") from None
+
+
+def validate_settings(upd, current, create=True):
+    """Validate a settings update against the current config. Returns (changes, warnings, checks).
+    `changes` is a dict of normalized values for the keys present in `upd`; omitted keys are left alone.
+    Raises ValueError (message never contains the token)."""
+    changes, warnings, checks = {}, [], {}
+    if "model_dirs" in upd:
+        md = upd["model_dirs"]
+        if isinstance(md, str):
+            md = [x for x in md.splitlines()]
+        if not isinstance(md, list) or not md:
+            raise ValueError("model_dirs needs at least one directory")
+        dirs = []
+        for x in md:
+            x = _abs_path("model_dirs entry", x)
+            if x not in dirs:
+                dirs.append(x)
+            if not os.path.isdir(os.path.expanduser(x)):
+                warnings.append(f"model dir {x} does not exist right now")
+        changes["model_dirs"] = dirs
+    if "download_dir" in upd:
+        dd = _abs_path("download_dir", upd["download_dir"], allow_empty=True)
+        if dd:
+            check_writable_dir(dd, create)
+        changes["download_dir"] = dd
+        checks["download_dir"] = "writable" if dd else "default (first model dir)"
+    if "hf_home" in upd:
+        hh = _abs_path("hf_home", upd["hf_home"], allow_empty=True)
+        if hh and not os.path.isdir(os.path.expanduser(hh)):
+            warnings.append(f"HF cache {hh} does not exist yet")
+        changes["hf_home"] = hh
+    if "llama_server" in upd:
+        ls = _abs_path("llama_server", upd["llama_server"])
+        p = os.path.expanduser(ls)
+        if not os.path.isfile(p):
+            raise ValueError(f"llama_server {ls} is not a file")
+        if not os.access(p, os.X_OK):
+            raise ValueError(f"llama_server {ls} is not executable")
+        ver = tool_version(p, ttl=0)
+        checks["llama_server_version"] = ver
+        if ver is None:
+            warnings.append("llama-server --version failed or timed out; the path is executable, so it was accepted")
+        changes["llama_server"] = ls
+    if "hf_endpoint" in upd:
+        ep = str(upd["hf_endpoint"] or "").strip().rstrip("/") or DEFAULTS["hf_endpoint"]
+        u = urllib.parse.urlsplit(ep)
+        if u.scheme not in ("http", "https") or not u.netloc or any(c.isspace() for c in ep):
+            raise ValueError("hf_endpoint must be an http(s) URL")
+        changes["hf_endpoint"] = ep
+    if "min_free_gib_for_download" in upd:
+        try:
+            v = float(upd["min_free_gib_for_download"])
+        except (TypeError, ValueError):
+            raise ValueError("min_free_gib_for_download must be a number") from None
+        if v < 0 or v != v or v > 1e7:
+            raise ValueError("min_free_gib_for_download must be >= 0")
+        changes["min_free_gib_for_download"] = int(v) if v == int(v) else v
+    tok = upd.get("hf_token")
+    if tok not in (None, ""):
+        if not isinstance(tok, str) or len(tok) > 512 or re.search(r"\s|[\x00-\x1f]", tok):
+            raise ValueError("hf_token must be a single token without whitespace")
+        changes["hf_token"] = tok
+    if upd.get("clear_hf_token") and "hf_token" in changes:
+        raise ValueError("send either hf_token or clear_hf_token, not both")
+    return changes, warnings, checks
+
+
+def apply_settings(cfg, upd, dry_run=False):
+    """Validate and (unless dry_run) persist a settings update through Config.save, the same path as PUT /api/config.
+    Nothing here restarts llama-server or Kev. Returns {ok, saved, warnings, checks, settings}."""
+    changes, warnings, checks = validate_settings(upd, cfg.data, create=not dry_run)
+    if not dry_run:
+        new = json.loads(json.dumps(cfg.data))
+        kev_hf = changes.pop("hf_home", None)
+        new.update(changes)
+        if kev_hf is not None:
+            new["kev"]["hf_home"] = kev_hf
+        cfg.save(new, clear_token=bool(upd.get("clear_hf_token")))
+    return {"ok": True, "saved": not dry_run, "warnings": warnings, "checks": checks, "settings": public_settings(cfg.data)}
 
 
 class SSECount:
@@ -1542,7 +1904,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"now": time.time(), "interval_s": smp.interval, "cpu_ids": smp.cpu_ids,
                                    "cpus_pinned": pin, "samples": smp.since(since)})
         if path == "/api/config" and method == "GET":
-            return self.send_json(cfg.data)
+            return self.send_json(public_config(cfg.data))
+        if path == "/api/system" and method == "GET":
+            return self.send_json(system_info(cfg.data))
+        if path == "/api/system/settings" and method == "POST":
+            d = self.json_body()
+            if not isinstance(d, dict):
+                return self.send_json({"error": "invalid JSON"}, 400)
+            try:
+                return self.send_json(apply_settings(cfg, d, dry_run=bool(d.get("dry_run"))))
+            except (ValueError, KeyError, TypeError, OSError) as e:
+                return self.send_json({"error": str(e)}, 400)
         if path == "/api/config" and method == "PUT":
             d = self.json_body()
             if d is None:
