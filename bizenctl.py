@@ -37,6 +37,7 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
 TPS_RE = re.compile(r"eval time\s*=.*?([\d.]+)\s*tokens per second")
 PROMPT_TPS_RE = re.compile(r"prompt eval time\s*=.*?([\d.]+)\s*tokens per second")
+MODEL_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
 GEN_PATHS = ("/v1/chat/completions", "/v1/completions", "/completion", "/chat/completions", "/completions")
 # load phases, in order; each log line can only move the phase forward. Patterns are llama.cpp-style and optional.
 LOAD_PHASES = ["starting", "reading tensors", "allocating/warming", "ready"]
@@ -107,6 +108,8 @@ DEFAULTS = {
     "idle_ttl_min": 10,
     "keep_loaded": False,
     "start_timeout_s": 600,
+    "switch_wait_s": 120,           # a request naming another profile waits this long for busy requests, then gets 503
+    "strict_model_names": True,     # unknown model names get 404; false = serve them like 'auto'
     "active_profile": "",
     "profiles": [],
     "kev": {},
@@ -248,6 +251,11 @@ class Config:
                 raise ValueError("every route needs a description")
             if r["default_profile"] not in names:
                 raise ValueError("router default_profile must be an existing profile")
+        sw = d["switch_wait_s"]
+        if isinstance(sw, bool) or not isinstance(sw, int) or not 0 <= sw <= 1800:
+            raise ValueError("switch_wait_s must be an integer between 0 and 1800")
+        if not isinstance(d["strict_model_names"], bool):
+            raise ValueError("strict_model_names must be true or false")
         if not str(d.get("hf_endpoint") or "").startswith(("http://", "https://")):
             raise ValueError("hf_endpoint must be an http(s) URL")
         if not isinstance(d["model_dirs"], list):
@@ -2209,6 +2217,51 @@ class SSECount:
 
 # ---------------------------------------------------------------- supervisor
 
+def resolve_model(model, names, alias, router_enabled, strict):
+    """Pure: map a request's model field to what the proxy should do.
+    ("profile", name) | ("router", None) | ("auto", None) | ("unknown", name).
+    Matching is exact (case-sensitive). A missing, empty or non-string model is 'auto' in the
+    "whatever is active" sense: it never wakes the router (as before this change)."""
+    if not isinstance(model, str) or not model:
+        return ("auto", None)
+    if model in names:
+        return ("profile", model)
+    if model == alias:
+        return ("router", None) if router_enabled else ("auto", None)
+    return ("auto", None) if not strict else ("unknown", model)
+
+
+def switch_decision(alive, cur, state, others, profile):
+    """Pure: serve | start | switch | busy for a request that named `profile`.
+    `others` = requests in flight besides this one."""
+    if not alive or state in ("stopped", "failed"):
+        return "start"
+    if cur == profile:
+        return "serve"
+    if state != "running":          # another profile is loading/stopping for someone else
+        return "busy"
+    return "busy" if others > 0 else "switch"
+
+
+def acquire_profile(sup, profile, wait_s, poll=0.5, now=time.time, sleep=time.sleep):
+    """Make `profile` the loaded one, waiting (off every lock) up to wait_s for other requests to finish.
+    Returns ("ok", 0) or ("busy", n_requests_still_running_on_the_other_profile)."""
+    deadline = now() + max(0, wait_s)
+    waiting = False
+    try:
+        while True:
+            st, n = sup.claim_named(profile, waiting)
+            if st == "ok" or now() >= deadline:
+                return st, n
+            if not waiting:
+                sup.wait_mark(+1)
+                waiting = True
+            sleep(poll)
+    finally:
+        if waiting:
+            sup.wait_mark(-1)
+
+
 class Supervisor:
     """Owns the llama-server child: start/stop, health, idle unload, logs."""
 
@@ -2237,6 +2290,7 @@ class Supervisor:
         self.internal_key = secrets.token_urlsafe(24)
         self.ready_event = threading.Event()
         self.switch_lock = threading.Lock()   # serialises routed profile switches
+        self.sw_waiters = 0                   # requests parked in acquire_profile waiting for another profile to go idle
         self.routed = False                   # the running profile was chosen by the router
         self.kev = None                       # set in main(): its GPUs are off limits to us
         threading.Thread(target=self._idle_loop, daemon=True).start()
@@ -2609,6 +2663,35 @@ class Supervisor:
                 self.start(profile, via_router=bool(profile))
         self.ready_event.wait(timeout)
         return self.state == "running"
+
+    def claim_named(self, profile, waiting=False):
+        """One attempt to make `profile` the loaded one for a request that named it.
+        Returns ("ok", 0) once it is loaded/loading/started, or ("busy", n) when another
+        profile is serving n other requests or is still loading for someone. Never stops a
+        profile that has other requests in flight or is loading."""
+        with self.switch_lock:
+            with self.lock:
+                alive = bool(self.proc and self.proc.poll() is None)
+                cur = self.running_profile["name"] if alive and self.running_profile else None
+                # inflight includes this request; other parked waiters do not count as work
+                others = max(0, self.inflight - 1 - max(0, self.sw_waiters - (1 if waiting else 0)))
+                act = switch_decision(alive, cur, self.state, others, profile)
+            if act == "busy":
+                return "busy", max(others, 1)
+            if act == "switch":
+                self.stop(f"model switch to {profile}")
+            if act in ("switch", "start"):
+                self.start(profile, via_router=True)
+        return "ok", 0
+
+    def wait_ready(self, timeout):
+        """Wait for the profile claim_named picked; never starts anything itself."""
+        self.ready_event.wait(timeout)
+        return self.state == "running"
+
+    def wait_mark(self, delta):
+        with self.lock:
+            self.sw_waiters += delta
 
     def serving(self):
         """Name of the profile currently loaded or loading, else None."""
@@ -3224,10 +3307,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.server.dl
 
     # -- helpers
-    def send_json(self, obj, code=200):
+    def send_json(self, obj, code=200, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -3640,40 +3725,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sup, router = self.sup, self.server.router
         path = urllib.parse.urlsplit(self.path).path
         if path == "/v1/models" and method == "GET":
-            ids = [p["name"] for p in self.cfg.get("profiles")]
-            if router.enabled():
-                ids.append(self.cfg.get("router")["alias"])
+            ids = [p["name"] for p in self.cfg.get("profiles")] + [self.cfg.get("router")["alias"]]
             return self.send_json({"object": "list", "data": [
                 {"id": i, "object": "model", "owned_by": "bizen-ctl"} for i in ids]})
         if path == "/v1/route" and method == "POST":
             return self.route_endpoint()
         body = self.body()
+        names = [p["name"] for p in self.cfg.get("profiles")]
+        alias = self.cfg.get("router")["alias"]
+        kind, named, req = "auto", None, None
+        if method == "POST" and path in MODEL_PATHS:
+            try:
+                req = json.loads(body or b"{}")
+            except (ValueError, RecursionError):
+                req = None
+            if isinstance(req, dict):
+                kind, named = resolve_model(req.get("model"), names, alias, router.enabled(),
+                                            self.cfg.get("strict_model_names"))
+                if kind == "router" and path not in ("/v1/chat/completions", "/v1/completions"):
+                    kind = "auto"
+            else:
+                req = None
+        if kind == "unknown":
+            return self.send_json({"error": {"message": f"unknown model '{str(named)[:80]}'; available: "
+                                             + ", ".join(names + [alias]), "type": "model_not_found"}}, 404)
         sup.touch(+1)
         target, extra = None, {}
         gid, tail, tokens, tps = None, b"", None, None
         try:
-            if method == "POST" and router.enabled() and path in ("/v1/chat/completions", "/v1/completions"):
-                try:
-                    req = json.loads(body or b"{}")
-                except json.JSONDecodeError:
-                    req = {}
-                if isinstance(req, dict) and req.get("model") == self.cfg.get("router")["alias"]:
-                    dec = router.safe_decide(Router.prompt_of(req))
-                    target = dec["profile"]
-                    req["model"] = target
-                    body = json.dumps(req).encode()
-                    extra["X-Bizen-Route"] = target
-                    if dec.get("probability") is not None:
-                        extra["X-Bizen-Route-P"] = f"{dec['probability']:.3f}"
-                    if dec.get("fallback"):
-                        extra["X-Bizen-Route-Fallback"] = re.sub(r"[^\x20-\x7e]", "?", dec["fallback"])[:200]
-            if not sup.ensure_ready(self.cfg.get("start_timeout_s"), profile=target):
+            if kind == "router":
+                dec = router.safe_decide(Router.prompt_of(req))
+                target = dec["profile"]
+                req["model"] = target
+                body = json.dumps(req).encode()
+                extra["X-Bizen-Route"] = target
+                if dec.get("probability") is not None:
+                    extra["X-Bizen-Route-P"] = f"{dec['probability']:.3f}"
+                if dec.get("fallback"):
+                    extra["X-Bizen-Route-Fallback"] = re.sub(r"[^\x20-\x7e]", "?", dec["fallback"])[:200]
+            if kind == "profile":
+                st, n = acquire_profile(sup, named, self.cfg.get("switch_wait_s"))
+                if st == "busy":
+                    cur = sup.serving() or "another profile"
+                    return self.send_json({"error": {"message": f"busy: {cur} is serving {n} request(s); retry later",
+                                                     "type": "busy"}}, 503, {"Retry-After": "30"})
+            if not (sup.wait_ready(self.cfg.get("start_timeout_s")) if kind == "profile"
+                    else sup.ensure_ready(self.cfg.get("start_timeout_s"), profile=target)):
                 return self.send_json({"error": {"message": sup.error or f"model not ready ({sup.state})",
                                                  "type": "unavailable"}}, 503)
-            if target:
-                served = sup.serving()
-                if served and served != target:
-                    extra["X-Bizen-Route-Served"] = served   # busy: kept the loaded profile
+            served = sup.serving()
+            if kind == "profile" and served != named:
+                return self.send_json({"error": {"message": f"busy: {served or 'another profile'} replaced {named}; retry later",
+                                                 "type": "busy"}}, 503, {"Retry-After": "30"})
+            if served:
+                extra["X-Bizen-Profile"] = served
+            if target and served and served != target:
+                extra["X-Bizen-Route-Served"] = served   # busy: kept the loaded profile
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS
                        and k.lower() not in ("authorization", "x-api-key", "cookie")}
             headers["Authorization"] = f"Bearer {sup.internal_key}"
