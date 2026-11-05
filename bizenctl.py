@@ -22,6 +22,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import socketserver
 import stat
 import subprocess
@@ -1117,11 +1118,7 @@ def live_gpu_mems():
 
 def library_scan_now(cfg, sup):
     """scan_library with live GPU / RAM / loaded-model data from the running controller."""
-    gm = live_gpu_mems()
-    try:
-        ram = meminfo().get("total_mib")
-    except Exception:  # noqa: BLE001
-        ram = None
+    gm, ram = fit_inputs()
     lm = None
     try:
         if sup.serving():
@@ -1248,6 +1245,403 @@ def library_draft(cfg, sup, d):
     if ent["mmproj"]:
         notes.append(f"vision projector found: add --mmproj {ent['mmproj']} to extra args if you want image input")
     return 200, {"draft": True, "profile": prof, "fit": ent["fit"], "notes": notes}
+
+
+# ---------------------------------------------------------------- Hugging Face: browse (GET /api/hf/search, /api/hf/repo)
+
+HF_REPO_RE = re.compile(r"^[A-Za-z0-9][\w.\-]*/[\w.\-]+$")
+HF_FILE_RE = re.compile(r"^[\w.\-]+(/[\w.\-]+)*$")
+HF_TIMEOUT = 15                  # seconds: connect and every socket read
+HF_CALL_BUDGET = 30              # seconds for one JSON/text fetch including a slow trickle
+HF_SORTS = ("downloads", "likes", "lastModified")
+HF_CACHE_TTL = 60
+HF_CARD_CHARS = 20000
+_HF_CACHE = {}
+_HF_CACHE_LOCK = threading.Lock()
+
+
+class HFError(Exception):
+    """A readable failure from the Hugging Face side. code = the HTTP status our own API answers with."""
+    def __init__(self, code, msg, upstream=None):
+        super().__init__(msg)
+        self.code, self.msg, self.upstream = code, msg, upstream
+
+
+def hf_valid_repo(repo):
+    r = str(repo or "")
+    if len(r) > 200 or not HF_REPO_RE.match(r):
+        return False
+    return not any(set(part) <= {"."} for part in r.split("/"))
+
+
+def hf_valid_file(path):
+    p = str(path or "")
+    if len(p) > 400 or not HF_FILE_RE.match(p) or ".." in p:
+        return False
+    return p.lower().endswith(".gguf")
+
+
+def _origin(url):
+    u = urllib.parse.urlsplit(url)
+    return (u.scheme, (u.hostname or "").lower(), u.port or (443 if u.scheme == "https" else 80))
+
+
+def hf_request(url, token="", origin_url=None, headers=None, timeout=HF_TIMEOUT, max_redirects=5, on_conn=None):
+    """GET url and follow redirects by hand. The bearer token goes only to the origin of origin_url (scheme, host,
+    port): any hop to another host (the CDN) is requested without it. Returns (conn, resp, final_url); the caller
+    closes conn. Raises OSError / http.client.HTTPException on network trouble, HFError on a bad redirect."""
+    for _ in range(max_redirects + 1):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise HFError(502, "Hugging Face sent a redirect to a non-http URL")
+        cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        conn = cls(u.hostname, u.port, timeout=timeout)
+        if on_conn:
+            on_conn(conn)
+        hdrs = {"User-Agent": "bizen-ctl", "Accept-Encoding": "identity"}
+        hdrs.update(headers or {})
+        if token and origin_url and _origin(url) == _origin(origin_url):
+            hdrs["Authorization"] = "Bearer " + token
+        try:
+            conn.request("GET", (u.path or "/") + (("?" + u.query) if u.query else ""), headers=hdrs)
+            resp = conn.getresponse()
+        except BaseException:
+            conn.close()
+            raise
+        if resp.status in (301, 302, 303, 307, 308) and resp.getheader("Location"):
+            nxt = urllib.parse.urljoin(url, resp.getheader("Location"))
+            resp.close()
+            conn.close()
+            url = nxt
+            continue
+        return conn, resp, url
+    raise HFError(502, "too many redirects from Hugging Face")
+
+
+def hf_status_error(status, token_sent):
+    if status in (401, 403):
+        return HFError(403, "repo not found or gated; token rejected (check the token in System)" if token_sent
+                       else "repo not found or gated (set a token in System)", status)
+    if status == 404:
+        return HFError(404, "repo not found, or gated and the saved token has no access" if token_sent
+                       else "repo not found or gated (set a token in System)", status)
+    if status == 429:
+        return HFError(429, "Hugging Face is rate limiting requests; try again in a minute", status)
+    return HFError(502, f"Hugging Face answered HTTP {status}", status)
+
+
+def hf_net_error(e, host):
+    if isinstance(e, HFError):
+        return e
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return HFError(504, f"timed out talking to {host} ({HF_TIMEOUT} s)")
+    if isinstance(e, (OSError, http.client.HTTPException)):
+        return HFError(502, f"could not reach {host}: {getattr(e, 'reason', None) or e.__class__.__name__ + ': ' + str(e)}"[:300])
+    return HFError(502, "unexpected error talking to Hugging Face")
+
+
+def hf_get(url, token, endpoint, max_bytes, ok_missing=False):
+    """Fetch url -> (headers dict with lower-case keys, body bytes, truncated). Non-2xx raises HFError (404 -> None
+    when ok_missing). Never raises anything else; bounded in bytes and in time."""
+    host = urllib.parse.urlsplit(endpoint).netloc
+    t_end = time.monotonic() + HF_CALL_BUDGET
+    conn = None
+    try:
+        conn, resp, _ = hf_request(url, token, endpoint)
+        if resp.status == 404 and ok_missing:
+            return {}, None, False
+        if not 200 <= resp.status < 300:
+            raise hf_status_error(resp.status, bool(token))
+        buf, trunc = bytearray(), False
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > max_bytes:
+                del buf[max_bytes:]
+                trunc = True
+                break
+            if time.monotonic() > t_end:
+                raise HFError(504, f"{host} answered too slowly")
+        return {k.lower(): v for k, v in resp.getheaders()}, bytes(buf), trunc
+    except HFError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise hf_net_error(e, host) from None
+    finally:
+        if conn:
+            conn.close()
+
+
+def hf_json(url, token, endpoint, max_bytes=8 << 20):
+    headers, body, trunc = hf_get(url, token, endpoint, max_bytes)
+    if trunc:
+        raise HFError(502, "Hugging Face response is too large")
+    try:
+        return headers, json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        raise HFError(502, "Hugging Face sent a response that is not JSON") from None
+
+
+def run_with_deadline(fn, deadline):
+    """Run fn on a helper thread so the request thread never sits in a network call forever."""
+    box = {}
+
+    def target():
+        try:
+            box["v"] = fn()
+        except HFError as e:
+            box["e"] = e
+        except Exception as e:  # noqa: BLE001
+            box["e"] = HFError(502, f"unexpected error ({e.__class__.__name__})")
+
+    t = threading.Thread(target=target, daemon=True, name="hf-fetch")
+    t.start()
+    t.join(deadline)
+    if t.is_alive():
+        raise HFError(504, "Hugging Face took too long to answer")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
+def _hf_cache_get(key):
+    with _HF_CACHE_LOCK:
+        hit = _HF_CACHE.get(key)
+        if hit and time.time() - hit[0] < HF_CACHE_TTL:
+            return hit[1]
+        _HF_CACHE.pop(key, None)
+    return None
+
+
+def _hf_cache_put(key, val):
+    with _HF_CACHE_LOCK:
+        if len(_HF_CACHE) > 64:
+            for k in sorted(_HF_CACHE, key=lambda k: _HF_CACHE[k][0])[:16]:
+                _HF_CACHE.pop(k, None)
+        _HF_CACHE[key] = (time.time(), val)
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def hf_map_model(m):
+    """One search hit -> the shape the UI uses; None for rows without a valid repo id."""
+    if not isinstance(m, dict):
+        return None
+    mid = m.get("id") or m.get("modelId") or ""
+    if not hf_valid_repo(mid):
+        return None
+    tags = [t for t in (m.get("tags") or []) if isinstance(t, str)][:40]
+    gated = m.get("gated")
+    return {"id": mid, "author": str(m.get("author") or mid.split("/")[0]), "downloads": _int(m.get("downloads")),
+            "likes": _int(m.get("likes")), "last_modified": m.get("lastModified") or m.get("last_modified"),
+            "tags": tags, "private": bool(m.get("private")), "gated": gated if isinstance(gated, str) and gated else bool(gated)}
+
+
+def hf_search(cfg, q, sort, limit):
+    """cfg: plain config dict. Returns {"results": [...], "query", "sort", "cached"}. Raises HFError."""
+    endpoint = str(cfg.get("hf_endpoint") or DEFAULTS["hf_endpoint"]).rstrip("/")
+    token = str(cfg.get("hf_token") or "")
+    key = ("search", endpoint, bool(token), q, sort, limit)
+    hit = _hf_cache_get(key)
+    if hit is not None:
+        return dict(hit, cached=True)
+
+    def fetch():
+        base = [("search", q), ("filter", "gguf"), ("sort", sort), ("direction", "-1"), ("limit", str(limit))] if q else \
+               [("filter", "gguf"), ("sort", sort), ("direction", "-1"), ("limit", str(limit))]
+        expand = [("expand[]", f) for f in ("author", "downloads", "likes", "lastModified", "tags", "private", "gated")]
+        try:
+            _, data = hf_json(endpoint + "/api/models?" + urllib.parse.urlencode(base + expand), token, endpoint)
+        except HFError as e:
+            if e.upstream != 400:
+                raise
+            _, data = hf_json(endpoint + "/api/models?" + urllib.parse.urlencode(base), token, endpoint)
+        if not isinstance(data, list):
+            raise HFError(502, "unexpected search response from Hugging Face")
+        return [r for r in (hf_map_model(m) for m in data[:limit]) if r]
+
+    res = {"results": run_with_deadline(fetch, 2 * HF_CALL_BUDGET), "query": q, "sort": sort, "cached": False}
+    _hf_cache_put(key, res)
+    return res
+
+
+def hf_group_sets(files):
+    """files: [{path, bytes}] (.gguf only) -> quant sets, multi-shard sets collapsed, mmproj attached per folder.
+    Each set: {name, quant, dir, files:[{path,bytes}], bytes, gib, shards, shards_expected, complete, mmproj}."""
+    mm, groups = {}, {}
+    for f in files:
+        d, _, base = f["path"].rpartition("/")
+        if "mmproj" in base.lower():
+            mm.setdefault(d, []).append(f)
+            continue
+        sm = SHARD_RE.match(base)
+        if sm:
+            g = groups.setdefault((d, sm.group(1), sm.group(3)), {"dir": d, "name": sm.group(1), "total": int(sm.group(3)), "sh": {}})
+            g["sh"][int(sm.group(2))] = f
+        else:
+            groups[(d, base, "1")] = {"dir": d, "name": base[:-5], "total": 1, "sh": {1: f}}
+
+    def pick_mm(d):
+        c = mm.get(d) or mm.get("") or []
+        c = sorted(c, key=lambda x: ("f16" not in x["path"].lower(), x["path"]))
+        return {"path": c[0]["path"], "bytes": c[0]["bytes"]} if c else None
+
+    sets = []
+    for g in groups.values():
+        fl = [{"path": g["sh"][i]["path"], "bytes": g["sh"][i]["bytes"]} for i in sorted(g["sh"])]
+        size = sum(x["bytes"] for x in fl)
+        sets.append({"name": g["name"], "quant": parse_quant(g["name"]) or parse_quant(g["dir"].rpartition("/")[2]),
+                     "dir": g["dir"], "files": fl, "bytes": size, "gib": round(size / 2**30, 2), "shards": len(fl),
+                     "shards_expected": g["total"], "complete": len(fl) == g["total"], "mmproj": pick_mm(g["dir"])})
+    sets.sort(key=lambda s: (s["bytes"], s["name"]))
+    return sets
+
+
+_FM_RE = re.compile(r"\A﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
+
+
+def split_front_matter(text):
+    m = _FM_RE.match(text)
+    return (m.group(1), text[m.end():]) if m else ("", text)
+
+
+def _fm_value(front, key):
+    m = re.search(r"^" + key + r":[ \t]*(.*)$", front, re.M)
+    if not m:
+        return None
+    v = m.group(1).strip().strip("'\"")
+    if v:
+        return v
+    items = re.findall(r"^[ \t]*-[ \t]*(\S.*)$", front[m.end():], re.M)
+    return items[0].strip().strip("'\"") if items else None
+
+
+def hf_repo_hints(meta, front):
+    """license / base_model / architecture from the repo metadata, falling back to the card front matter."""
+    card = meta.get("cardData") if isinstance(meta.get("cardData"), dict) else {}
+    tags = [t for t in (meta.get("tags") or []) if isinstance(t, str)]
+
+    def first(v):
+        if isinstance(v, list):
+            v = v[0] if v else None
+        return str(v)[:120] if v not in (None, "") else None
+
+    lic = first(card.get("license")) or next((t[8:] for t in tags if t.startswith("license:")), None) or _fm_value(front, "license")
+    bm = card.get("base_model")
+    if isinstance(bm, str):
+        bm = [bm]
+    if not isinstance(bm, list):
+        bm = [t.rsplit(":", 1)[1] for t in tags if t.startswith("base_model:")]
+    bm = [str(x)[:120] for x in bm if isinstance(x, str)][:4] or ([_fm_value(front, "base_model")] if _fm_value(front, "base_model") else [])
+    gg = meta.get("gguf") if isinstance(meta.get("gguf"), dict) else {}
+    return {"license": lic, "base_model": bm, "architecture": first(gg.get("architecture"))}
+
+
+def hf_next_link(headers, endpoint):
+    """URL from a `Link: <...>; rel="next"` header, only when it stays on the endpoint's own origin."""
+    m = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', headers.get("link", ""))
+    if not m:
+        return None
+    url = urllib.parse.urljoin(endpoint + "/", m.group(1))
+    return url if _origin(url) == _origin(endpoint) else None
+
+
+def hf_repo_raw(cfg, repo):
+    """Network part of GET /api/hf/repo: {meta, files:[{path,bytes}], skipped, tree_truncated, card, card_truncated}.
+    Cached 60 s. Raises HFError."""
+    endpoint = str(cfg.get("hf_endpoint") or DEFAULTS["hf_endpoint"]).rstrip("/")
+    token = str(cfg.get("hf_token") or "")
+    key = ("repo", endpoint, bool(token), repo)
+    hit = _hf_cache_get(key)
+    if hit is not None:
+        return hit
+    rq = urllib.parse.quote(repo, safe="/")
+
+    def fetch():
+        _, meta = hf_json(f"{endpoint}/api/models/{rq}", token, endpoint, 2 << 20)
+        if not isinstance(meta, dict):
+            raise HFError(502, "unexpected repo response from Hugging Face")
+        files, skipped, truncated = [], 0, False
+        url, pages = f"{endpoint}/api/models/{rq}/tree/main?recursive=1", 0
+        while url and pages < 30:
+            hdrs, data = hf_json(url, token, endpoint, 16 << 20)
+            pages += 1
+            if not isinstance(data, list):
+                raise HFError(502, "unexpected file list from Hugging Face")
+            for e in data:
+                if not isinstance(e, dict) or e.get("type", "file") != "file":
+                    continue
+                p = str(e.get("path") or "")
+                if not p.lower().endswith(".gguf"):
+                    continue
+                lfs = e.get("lfs") if isinstance(e.get("lfs"), dict) else {}
+                size = _int(lfs.get("size")) or _int(e.get("size"))
+                if not hf_valid_file(p) or size <= 0:
+                    skipped += 1
+                    continue
+                files.append({"path": p, "bytes": size})
+            url = hf_next_link(hdrs, endpoint)
+            if len(files) > 5000:
+                truncated = True
+                break
+        if url and pages >= 30:
+            truncated = True
+        card, card_trunc, front = "", False, ""
+        _, body, _t = hf_get(f"{endpoint}/{rq}/raw/main/README.md", token, endpoint, 200000, ok_missing=True)
+        if body is not None:
+            front, text = split_front_matter(body.decode("utf-8", "replace"))
+            card_trunc = len(text) > HF_CARD_CHARS
+            card = text[:HF_CARD_CHARS]
+        return {"meta": meta, "files": files, "skipped": skipped, "tree_truncated": truncated,
+                "card": card, "card_truncated": card_trunc, "front": front}
+
+    raw = run_with_deadline(fetch, 4 * HF_CALL_BUDGET)
+    _hf_cache_put(key, raw)
+    return raw
+
+
+def fit_inputs():
+    """(per-GPU total MiB, system RAM MiB or None) as the Library uses them for its size-based verdicts."""
+    gm = live_gpu_mems()
+    try:
+        ram = meminfo().get("total_mib")
+    except Exception:  # noqa: BLE001
+        ram = None
+    return gm, ram
+
+
+def hf_repo_view(cfg, repo):
+    """Everything GET /api/hf/repo returns. cfg: plain config dict. Raises HFError."""
+    raw = hf_repo_raw(cfg, repo)
+    meta = raw["meta"]
+    gm, ram = fit_inputs()
+    vram = sum(m for m in gm if m) or None
+    try:
+        have = {m["name"] for m in scan_library(cfg, gm, ram)["models"]
+                if m["complete"] and not m["partial"]}
+    except Exception:  # noqa: BLE001
+        have = set()
+    sets = hf_group_sets(raw["files"])
+    for s in sets:
+        s["fit"] = fit_verdict(s["bytes"], vram, ram) if s["complete"] else {
+            "vram_total_mib": vram, "ram_total_mib": ram, "verdict": None, "text": "Incomplete set in the repo, so no estimate. " + FIT_NOTE}
+        s["already_downloaded"] = s["name"] in have
+    hint = hf_repo_hints(meta, raw["front"])
+    m = hf_map_model(dict(meta, id=meta.get("id") or meta.get("modelId") or repo)) or {}
+    out = {"id": repo, "author": m.get("author") or repo.split("/")[0], "downloads": m.get("downloads", 0),
+           "likes": m.get("likes", 0), "last_modified": m.get("last_modified"), "tags": m.get("tags", []),
+           "private": m.get("private", False), "gated": m.get("gated", False)}
+    out.update(hint)
+    out.update(sets=sets, card=raw["card"], card_truncated=raw["card_truncated"], skipped=raw["skipped"],
+               tree_truncated=raw["tree_truncated"], has_token=bool(cfg.get("hf_token")))
+    return out
 
 
 class SSECount:
@@ -2270,6 +2664,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(system_info(cfg.data))
         if path == "/api/library" and method == "GET":
             return self.send_json(library_scan_now(cfg, sup))
+        if path == "/api/hf/search" and method == "GET":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            term = (q.get("q") or [""])[0].strip()[:200]
+            sort = (q.get("sort") or ["downloads"])[0]
+            if sort not in HF_SORTS:
+                return self.send_json({"error": "sort must be one of " + ", ".join(HF_SORTS)}, 400)
+            try:
+                limit = max(1, min(50, int((q.get("limit") or ["20"])[0])))
+            except ValueError:
+                return self.send_json({"error": "limit must be an integer"}, 400)
+            try:
+                return self.send_json(hf_search(cfg.data, term, sort, limit))
+            except HFError as e:
+                return self.send_json({"error": e.msg}, e.code)
+        if path == "/api/hf/repo" and method == "GET":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            repo = (q.get("id") or [""])[0].strip()
+            if not hf_valid_repo(repo):
+                return self.send_json({"error": "id must look like owner/name"}, 400)
+            try:
+                return self.send_json(hf_repo_view(cfg.data, repo))
+            except HFError as e:
+                return self.send_json({"error": e.msg}, e.code)
         if path == "/api/library/profile" and method == "POST":
             d = self.json_body()
             if not isinstance(d, dict):
