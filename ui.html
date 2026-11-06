@@ -434,7 +434,8 @@
     <h2>Access</h2>
     <label>API keys (one per line; clients send <code>Authorization: Bearer &lt;key&gt;</code>)</label>
     <textarea id="keys" rows="3" class="key"></textarea>
-    <div class="row" style="margin:8px 0 14px"><button onclick="addKey()">Generate key</button><button class="primary" onclick="saveKeys()">Save keys</button></div>
+    <label class="check" style="margin:6px 0"><input id="reqkey" type="checkbox"> Require an API key for <code>/v1</code> (turn off only on a trusted network: anyone who can reach this port can then use the model; the admin pages keep their login)</label>
+    <div class="row" style="margin:8px 0 14px"><button onclick="addKey()">Generate key</button><button class="primary" onclick="saveKeys()">Save</button></div>
     <label>Change admin password</label>
     <div class="row"><input id="newpw" type="password" style="flex:1"><button onclick="savePw()">Change</button></div>
     <div class="row" style="margin-top:14px"><button class="danger" onclick="ctlRestart()">Restart controller</button>
@@ -486,9 +487,9 @@ async function loadConfig() {
   if (!sel || (!(draftProf && draftProf.name === sel) && !cfg.profiles.find(p => p.name === sel))) sel = cfg.active_profile;
   $('ttl').value = cfg.idle_ttl_min; $('keep').checked = cfg.keep_loaded;
   $('swait').value = cfg.switch_wait_s ?? 120; $('strict').checked = cfg.strict_model_names !== false;
-  $('keys').value = cfg.api_keys.join('\n');
+  $('keys').value = cfg.api_keys.join('\n'); $('reqkey').checked = cfg.require_api_key !== false;
   const host = location.hostname, port = location.port || 80;
-  $('endpoint').textContent = `base_url: ${location.protocol}//${host}:${port}/v1\napi_key:  ${cfg.api_keys[0] || '(none)'}\nmodel:    ${cfg.active_profile}`;
+  $('endpoint').textContent = `base_url: ${location.protocol}//${host}:${port}/v1\napi_key:  ${cfg.require_api_key === false ? '(not required)' : (cfg.api_keys[0] || '(none)')}\nmodel:    ${cfg.active_profile}`;
   renderTabs(); fillForm(); loadRouter();
 }
 
@@ -739,8 +740,8 @@ function addKey() {
   $('keys').value = ($('keys').value.trim() + '\n' + k).trim();
 }
 async function saveKeys() {
-  const c = structuredClone(cfg); c.api_keys = $('keys').value.split('\n').map(s => s.trim()).filter(Boolean);
-  try { await putConfig(c, 'Keys saved'); } catch (e) { toast(e.message, true); }
+  const c = structuredClone(cfg); c.api_keys = $('keys').value.split('\n').map(s => s.trim()).filter(Boolean); c.require_api_key = $('reqkey').checked;
+  try { await putConfig(c, 'Saved'); } catch (e) { toast(e.message, true); }
 }
 async function savePw() {
   const v = $('newpw').value; if (v.length < 8) return toast('Use at least 8 characters', true);

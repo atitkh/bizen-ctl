@@ -447,6 +447,21 @@ wait $S1 $W2
 ok "the waiter switched only after the 1gpu requests ended" $([ "$(cat "$T/w2.out")" = "200 qwen36-2gpu" ] && grep -q DONE "$T/s1.out" && echo 1 || echo 0)
 H4 $B4/api/status | j "print('final',d['server']['profile'],d['server']['inflight'])"
 kill $CTL4; sleep 1
+echo "--- require_api_key false: /v1 open without a key, admin pages still locked"
+python3 - "$T/config.json" "$T/config5.json" <<'EOF7'
+import json,sys
+c=json.load(open(sys.argv[1])); c.update(listen_port=18995, internal_port=18996, idle_ttl_min=0, api_keys=[], require_api_key=False)
+c["kev"]=dict(c["kev"], managed=False); c["router"]=dict(c["router"], enabled=False)
+json.dump(c,open(sys.argv[2],"w"))
+EOF7
+B5=http://127.0.0.1:18995
+MOCK_TOKENS=3 python3 -u "$D/bizenctl.py" --config "$T/config5.json" > "$T/ctl5.log" 2>&1 &
+CTL5=$!; sleep 1
+ok "no key needed: GET /v1/models is 200" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B5/v1/models)" = 200 ] && echo 1 || echo 0)
+ok "no key needed: chat completion is 200" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B5/v1/chat/completions -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}')" = 200 ] && echo 1 || echo 0)
+ok "admin API still needs the login (401)" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B5/api/status)" = 401 ] && echo 1 || echo 0)
+ok "admin config still needs the login (401)" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B5/api/config)" = 401 ] && echo 1 || echo 0)
+kill $CTL5; sleep 2
 echo "--- controller log"; cat "$T/ctl.log"
 echo "--- result"; if [ "$FAILS" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; fi
 exit $([ "$FAILS" = 0 ] && echo 0 || echo 1)

@@ -94,6 +94,7 @@ DEFAULTS = {
     "listen_host": "0.0.0.0",
     "listen_port": 8080,
     "api_keys": [],
+    "require_api_key": True,       # False = /v1/* answers without a key (admin pages keep their login); use only on a trusted network
     "admin_password": "",
     "llama_server": "~/llama.cpp/build/bin/llama-server",
     "model_dirs": ["/srv/fs/models"],
@@ -265,8 +266,10 @@ class Config:
                 raise ValueError
         except (TypeError, ValueError):
             raise ValueError("min_free_gib_for_download must be a number >= 0") from None
-        if not d["api_keys"]:
-            raise ValueError("api_keys must contain at least one key")
+        if not isinstance(d.get("require_api_key", True), bool):
+            raise ValueError("require_api_key must be true or false")
+        if d.get("require_api_key", True) and not d["api_keys"]:
+            raise ValueError("api_keys must contain at least one key (or set require_api_key to false)")
         if not d["admin_password"]:
             raise ValueError("admin_password must be set")
 
@@ -3363,6 +3366,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return bool(exp and exp > time.time())
 
     def api_key_ok(self):
+        if self.cfg.get("require_api_key") is False:
+            return True
         auth = self.headers.get("Authorization") or ""
         key = auth[7:].strip() if auth.lower().startswith("bearer ") else (self.headers.get("x-api-key") or "")
         return any(hmac.compare_digest(key, k) for k in self.cfg.get("api_keys")) if key else False

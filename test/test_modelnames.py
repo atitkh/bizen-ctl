@@ -147,5 +147,11 @@ class _Boom:
 check("profile_contexts never raises (supervisor error)", b.profile_contexts(cfgc, _Boom()).get("auto") == 32768)
 check("profile_contexts never raises (garbage cfg)", b.profile_contexts(None, None) == {})
 
+
+# require_api_key (default true): off means no key needed and an empty key list is allowed
+check("require_api_key defaults to true and empty api_keys is rejected then", not v(api_keys=[]))
+check("require_api_key false allows an empty api_keys list", v(api_keys=[], require_api_key=False))
+check("require_api_key false with keys still validates", v(require_api_key=False))
+check("require_api_key must be a bool", not any(v(require_api_key=x) for x in ("no", 0, None, "false")))
 print("FAILED: %d" % len(fails) if fails else "ALL PASSED")
 sys.exit(1 if fails else 0)
