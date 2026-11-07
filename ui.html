@@ -105,6 +105,24 @@
   .msg pre { font: 13.5px/1.5 system-ui, sans-serif; word-break: normal; overflow-wrap: anywhere; }
   .msg .think { color: var(--dim); font-style: italic; border-left: 2px solid var(--line); padding-left: 8px; margin-bottom: 6px; }
   .msg.err { border-color: var(--bad); color: var(--bad); }
+  .act-range { display: inline-flex; gap: 0; }
+  .act-range button { border-radius: 0; padding: 4px 12px; font-size: 12.5px; }
+  .act-range button:first-child { border-radius: 6px 0 0 6px; } .act-range button:last-child { border-radius: 0 6px 6px 0; }
+  .act-range button.sel { background: var(--acc); color: #0b1220; border-color: var(--acc); }
+  .act-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; margin-top: 4px; }
+  .act-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #12161d; }
+  .act-card h3 { margin: 0 0 6px; font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
+  .act-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+  .act-card .big { font-size: 22px; font-weight: 600; line-height: 1.1; }
+  .act-card dl { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12.5px; }
+  .act-card dt { color: var(--dim); } .act-card dd { margin: 0; text-align: right; font-family: var(--mono); }
+  table.act-tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.act-tbl th { text-align: left; color: var(--dim); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  table.act-tbl td { padding: 4px 8px; border-bottom: 1px solid #1c222c; font-family: var(--mono); }
+  table.act-tbl td.num, table.act-tbl th.num { text-align: right; }
+  .act-chart text { fill: var(--dim); font-size: 10px; font-family: var(--mono); }
+  .act-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--dim); margin: 6px 0 2px; }
+  .act-legend span { display: inline-flex; align-items: center; gap: 6px; }
   .gpugrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
   .gcard { background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-variant-numeric: tabular-nums; }
   .gcard.mine { border-color: #35568a; }
@@ -167,6 +185,7 @@
     <a href="#profiles" data-tab="profiles">Profiles</a>
     <a href="#library" data-tab="library">Library</a>
     <a href="#kev" data-tab="kev">Kev</a>
+    <a href="#activity" data-tab="activity">Activity</a>
     <a href="#logs" data-tab="logs">Logs</a>
     <a href="#system" data-tab="system">System</a>
     <a href="#access" data-tab="access">Access</a>
@@ -343,6 +362,16 @@
     <div><label>Type the model name to confirm: <code id="libModalName"></code></label><input id="libModalIn" class="key" autocomplete="off" oninput="libModalCheck()"></div>
     <div class="row" style="justify-content:flex-end"><button onclick="libModalClose()">Cancel</button><button class="danger" id="libModalGo" disabled onclick="libDeleteGo()">Delete forever</button></div>
   </div></div>
+  <div class="pane" id="pane-activity" data-tab="activity">
+  <section class="wide">
+    <h2>Activity <span class="sp"></span><span class="note" id="actNote" style="text-transform:none;letter-spacing:0"></span>
+      <span class="act-range" id="actRange"><button data-h="1">1h</button><button data-h="6">6h</button><button data-h="24">24h</button><button data-h="168">7d</button></span></h2>
+    <div class="note" style="margin-bottom:8px">Which model was loaded, and how fast each request ran. Only numbers are recorded (profile, tokens, time to first token, tok/s): never prompts or answers.</div>
+    <div id="actChart"><div class="note">loading…</div></div>
+  </section>
+  <section class="wide"><h2>Models in this window</h2><div id="actCards"></div></section>
+  <section class="wide"><h2>Recent requests</h2><div id="actTable"></div></section>
+  </div>
   <div class="pane" id="pane-kev" data-tab="kev">
   <section class="wide">
     <h2>Router (Kev) <span class="sp"></span><span id="kevState" class="pill s-stopped">Kev stopped</span>
@@ -1605,7 +1634,158 @@ async function libAddProfile(id) {
 tabHooks.library = { show() { libSubShow(); } };
 
 /* ---- tabs: selected tab lives in location.hash ---- */
-const TABS = ['dashboard', 'chat', 'profiles', 'library', 'kev', 'logs', 'system', 'access'];
+
+/* ---- Activity tab: model timeline, tok/s dots per request, per-profile cards, recent requests ---- */
+const ACT_PALETTE = ['#6aa8ff', '#4cc38a', '#e5b450', '#f778ba', '#a371f7', '#ff8a65', '#39c5cf', '#c0d36a', '#8bb4ff', '#d98cff'];
+let actHours = 24, actTimer = null, actData = null;
+function activityColor(name, names) {
+  const i = (names || []).indexOf(name);
+  if (i >= 0) return ACT_PALETTE[i % ACT_PALETTE.length];
+  let h = 0; for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return ACT_PALETTE[h % ACT_PALETTE.length];
+}
+/* events sorted by time -> [{t0, t1, state, profile}] covering exactly [from, to]; 'unknown' before the first event */
+function activitySegments(events, from, to) {
+  const evs = (events || []).filter(e => e && typeof e.t === 'number').slice().sort((a, b) => a.t - b.t);
+  const segs = []; let state = 'unknown', profile = null, t = from;
+  for (const e of evs) {
+    if (e.t <= from) { state = e.state; profile = e.profile; continue; }
+    if (e.t >= to) break;
+    segs.push({ t0: t, t1: e.t, state, profile }); t = e.t; state = e.state; profile = e.profile;
+  }
+  segs.push({ t0: t, t1: to, state, profile });
+  return segs.filter(s => s.t1 > s.t0);
+}
+function activityTicks(from, to) {
+  const span = to - from, steps = [300, 900, 1800, 3600, 10800, 21600, 43200, 86400, 172800];
+  const step = steps.find(s => span / s <= 8) || 172800, out = [];
+  for (let t = Math.ceil(from / step) * step; t <= to; t += step) out.push(t);
+  return { ticks: out, step };
+}
+function actFmtTime(t, step) {
+  const d = new Date(t * 1000), hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return step >= 86400 ? d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + hm : hm;
+}
+function actFmtDur(s) {
+  if (s == null) return '–';
+  s = Math.round(s); if (s < 90) return s + 's'; if (s < 5400) return Math.round(s / 60) + ' min'; return (s / 3600).toFixed(1) + ' h';
+}
+function actSvg(tag, attrs, text) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+  if (text != null) e.textContent = String(text);
+  return e;
+}
+function actEl(tag, cls, text) {
+  const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = String(text); return e;
+}
+const ACT_STATE_FILL = { stopped: '#2a313c', stopping: '#3a4350', failed: '#ef6b6b', offline: '#171b22', unknown: 'none' };
+function renderActivity(data, names) {
+  names = names || Object.keys((data && data.profiles) || {});
+  const root = actEl('div');
+  if (!data || typeof data.since !== 'number' || typeof data.now !== 'number') { root.appendChild(actEl('div', 'note', 'activity unavailable')); return root; }
+  const from = data.since, to = data.now, W = 1000, L = 38, R = 8, PW = W - L - R;
+  const X = t => L + (t - from) / (to - from) * PW;
+  const segs = activitySegments(data.events, from, to);
+  const reqs = (data.requests || []).filter(r => typeof r.t1 === 'number' && typeof r.tps === 'number');
+  const maxTps = Math.max(10, ...reqs.map(r => r.tps)), top = Math.ceil(maxTps / 10) * 10;
+  const TL_Y = 4, TL_H = 26, CH_Y = 52, CH_H = 150, H = CH_Y + CH_H + 22;
+  const svg = actSvg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'act-chart', style: 'width:100%;height:auto;display:block' });
+  svg.appendChild(actSvg('text', { x: 0, y: TL_Y + 17 }, 'model'));
+  for (const s of segs) {
+    const x0 = X(s.t0), x1 = X(s.t1), w = Math.max(0.5, x1 - x0);
+    const col = (s.state === 'running' || s.state === 'starting') && s.profile ? activityColor(s.profile, names) : ACT_STATE_FILL[s.state] || '#2a313c';
+    const r = actSvg('rect', { x: x0, y: TL_Y, width: w, height: TL_H, fill: col, opacity: s.state === 'starting' ? 0.4 : 1, rx: 2 });
+    r.appendChild(actSvg('title', {}, `${s.profile || s.state}: ${s.state}, ${actFmtDur(s.t1 - s.t0)} (${actFmtTime(s.t0, 0)} - ${actFmtTime(s.t1, 0)})`));
+    svg.appendChild(r);
+    if (s.state === 'running' && s.profile && w > 70) {
+      const t = actSvg('text', { x: x0 + 6, y: TL_Y + 17 }, s.profile); t.style.fill = '#0b1220'; t.style.fontSize = '11px'; svg.appendChild(t);
+    }
+  }
+  svg.appendChild(actSvg('text', { x: 0, y: CH_Y - 6 }, 'tok/s'));
+  for (const f of [0, 0.5, 1]) {
+    const y = CH_Y + CH_H - f * CH_H;
+    svg.appendChild(actSvg('line', { x1: L, x2: W - R, y1: y, y2: y, stroke: '#252b35', 'stroke-width': 1 }));
+    svg.appendChild(actSvg('text', { x: L - 4, y: y + 3, 'text-anchor': 'end' }, Math.round(top * f)));
+  }
+  const tk = activityTicks(from, to);
+  for (const t of tk.ticks) {
+    const x = X(t);
+    svg.appendChild(actSvg('line', { x1: x, x2: x, y1: CH_Y, y2: CH_Y + CH_H, stroke: '#1c222c', 'stroke-width': 1 }));
+    svg.appendChild(actSvg('text', { x, y: CH_Y + CH_H + 14, 'text-anchor': 'middle' }, actFmtTime(t, tk.step)));
+  }
+  for (const r of reqs) {
+    const cx = X(r.t1), cy = CH_Y + CH_H - (r.tps / top) * CH_H, rad = Math.max(2.5, Math.min(9, 2 + Math.sqrt(r.tokens || 1) / 6));
+    const c = actSvg('circle', { cx, cy, r: rad, fill: activityColor(r.profile || '?', names), opacity: 0.75 });
+    c.appendChild(actSvg('title', {}, `${r.profile || '?'}: ${r.tps} tok/s, ${r.tokens ?? '?'} tokens, first token ${r.ttft ?? '–'} s, ${actFmtTime(r.t1, 0)}`));
+    svg.appendChild(c);
+  }
+  if (!reqs.length) svg.appendChild(actSvg('text', { x: W / 2, y: CH_Y + CH_H / 2, 'text-anchor': 'middle' }, 'no requests in this window'));
+  root.appendChild(svg);
+  const leg = actEl('div', 'act-legend');
+  for (const n of names) {
+    const sp = actEl('span'); const d = actEl('i', 'act-dot'); d.style.background = activityColor(n, names);
+    sp.appendChild(d); sp.appendChild(document.createTextNode(n)); leg.appendChild(sp);
+  }
+  const key = actEl('span', null, 'bar = loaded model (faded = loading, grey = stopped, red = failed); dot = one request, size = tokens');
+  leg.appendChild(key); root.appendChild(leg);
+  return root;
+}
+function renderActivityCards(profiles, names) {
+  const box = actEl('div', 'act-cards');
+  const list = Object.keys(profiles || {}).sort((a, b) => (profiles[b].requests - profiles[a].requests) || a.localeCompare(b));
+  if (!list.length) { box.appendChild(actEl('div', 'note', 'nothing recorded in this window')); return box; }
+  const f = (v, u) => v == null ? '–' : v + (u || '');
+  for (const n of list) {
+    const p = profiles[n], card = actEl('div', 'act-card'), h = actEl('h3');
+    const d = actEl('i', 'act-dot'); d.style.background = activityColor(n, names); h.appendChild(d); h.appendChild(document.createTextNode(n)); card.appendChild(h);
+    card.appendChild(actEl('div', 'big', f(p.median_tps, ' tok/s')));
+    const dl = actEl('dl');
+    for (const [k, v] of [['requests', p.requests], ['avg tok/s', f(p.avg_tps)], ['first token', f(p.median_ttft, ' s')], ['tokens', p.tokens], ['loads', p.loads], ['avg load', p.avg_load_s == null ? '–' : actFmtDur(p.avg_load_s)]]) {
+      dl.appendChild(actEl('dt', null, k)); dl.appendChild(actEl('dd', null, v));
+    }
+    card.appendChild(dl); box.appendChild(card);
+  }
+  return box;
+}
+function renderActivityTable(requests, names) {
+  const t = actEl('table', 'act-tbl'), head = actEl('tr');
+  for (const [h, num] of [['time', 0], ['model', 0], ['tokens', 1], ['tok/s', 1], ['first token', 1], ['took', 1]]) head.appendChild(actEl('th', num ? 'num' : '', h));
+  t.appendChild(head);
+  const rows = (requests || []).slice().sort((a, b) => b.t1 - a.t1).slice(0, 25);
+  if (!rows.length) { const tr = actEl('tr'), td = actEl('td', null, 'no requests yet'); td.colSpan = 6; tr.appendChild(td); t.appendChild(tr); }
+  for (const r of rows) {
+    const tr = actEl('tr');
+    tr.appendChild(actEl('td', null, new Date(r.t1 * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })));
+    const m = actEl('td'); const d = actEl('i', 'act-dot'); d.style.background = activityColor(r.profile || '?', names); d.style.marginRight = '6px';
+    m.appendChild(d); m.appendChild(document.createTextNode(r.profile || '?')); tr.appendChild(m);
+    tr.appendChild(actEl('td', 'num', r.tokens ?? '–')); tr.appendChild(actEl('td', 'num', r.tps ?? '–'));
+    tr.appendChild(actEl('td', 'num', r.ttft == null ? '–' : r.ttft + ' s')); tr.appendChild(actEl('td', 'num', actFmtDur(r.t1 - r.t0)));
+    t.appendChild(tr);
+  }
+  return t;
+}
+async function loadActivity() {
+  try {
+    actData = await api('/api/activity?hours=' + actHours);
+    const names = ((typeof cfg !== 'undefined' && cfg && cfg.profiles) ? cfg.profiles.map(p => p.name) : []).concat(
+      Object.keys(actData.profiles || {}).filter(n => !(typeof cfg !== 'undefined' && cfg && cfg.profiles || []).some(p => p.name === n)));
+    $('actChart').replaceChildren(renderActivity(actData, names));
+    $('actCards').replaceChildren(renderActivityCards(actData.profiles, names));
+    $('actTable').replaceChildren(renderActivityTable(actData.requests, names));
+    $('actNote').textContent = `${actData.request_count} request${actData.request_count === 1 ? '' : 's'} · now: ${actData.state || '?'}${actData.profile ? ' (' + actData.profile + ')' : ''}`;
+  } catch (e) {
+    $('actChart').replaceChildren(actEl('div', 'note', 'activity unavailable: ' + (e && e.message || e)));
+  }
+}
+document.querySelectorAll('#actRange button').forEach(b => b.addEventListener('click', () => { actHours = Number(b.dataset.h); actMark(); loadActivity(); }));
+function actMark() { document.querySelectorAll('#actRange button').forEach(b => b.classList.toggle('sel', Number(b.dataset.h) === actHours)); }
+tabHooks.activity = {
+  show() { actMark(); loadActivity(); if (!actTimer) actTimer = setInterval(() => { if (!document.hidden) loadActivity(); }, 15000); },
+  hide() { if (actTimer) { clearInterval(actTimer); actTimer = null; } },
+};
+
+const TABS = ['dashboard', 'chat', 'profiles', 'library', 'kev', 'activity', 'logs', 'system', 'access'];
 function showTab(h) {
   const parts = String(h || '').split('/');
   let t = parts[0];

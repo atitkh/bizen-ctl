@@ -187,6 +187,12 @@ fields on driver 535 and browser rendering of the tab.
 
 - **Context window for clients:** `GET /v1/models` includes `context_length` and `max_model_len` for every profile (its `ctx` setting) and for `auto` (the profile `auto` would serve: the loaded or loading one, else the active profile). `GET /props` answers llama-server-style `n_ctx` / `default_generation_settings.n_ctx` from config and never starts a model, so a client that probes it (OpenClaw discovery) cannot trigger a load. Both need the API key.
 
+### Activity tab
+
+- **What it shows:** a timeline bar of which profile was loading, running, stopped or failed over the last 1 h / 6 h / 24 h / 7 d, one dot per request at its tok/s (dot size = tokens, colour = profile), a card per profile (requests, median and average tok/s, median time to first token, tokens, number of loads and average load time) and the 25 latest requests.
+- **What it stores:** numbers only. Per request: start and end time, profile, tokens, time to first token, tok/s. Per state change: time, state, profile. **Never prompt or answer text.** Kept in memory (last 2000 of each) and saved to `activity.json` next to `config.json` every 30 s and at shutdown; the file is git-ignored. After a restart the timeline shows an `offline` gap for the time the controller was down.
+- `GET /api/activity?hours=24` (login required; `hours` is clamped to 0.05 .. 720) returns `{now, since, state, profile, events, requests (newest 500), request_count, profiles}`. Chat-tab and `/v1` requests are both recorded.
+
 ## Notes
 
 - llama-server itself listens only on 127.0.0.1 with a random internal key. All outside access goes through the controller.

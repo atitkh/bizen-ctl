@@ -2310,6 +2310,7 @@ class Supervisor:
         self._load_reset(None)
         self.gen_reqs = {}                    # id -> {started, first, tokens, last}; guarded by self.lock
         self.gen_next = 0
+        self.activity = None          # ActivityLog, set by main(); records one entry per finished request
         self.gen_recent = collections.deque(maxlen=512)   # arrival times of recent token chunks
         self.gen_last_tps = None
         self.internal_key = secrets.token_urlsafe(24)
@@ -2476,6 +2477,15 @@ class Supervisor:
                 tps = (r["tokens"] - 1) / (r["last"] - r["first"])
             if tps:
                 self.gen_last_tps = round(float(tps), 2)
+            act = getattr(self, "activity", None)
+            if act is not None:
+                try:
+                    act.request({"t0": round(r["started"], 3), "t1": round(time.time(), 3), "profile": self.serving(),
+                                 "tokens": r["tokens"] or None,
+                                 "ttft": round(r["first"] - r["started"], 2) if r["first"] else None,
+                                 "tps": round(float(tps), 2) if tps else None})
+                except Exception as e:  # noqa: BLE001 - never let bookkeeping break a request
+                    log(f"activity: {type(e).__name__}: {e}")
 
     def gen_info(self):
         """{active, requests, tokens, ttft_s, tps, last_tps}. tokens/ttft_s belong to the newest running request
@@ -3063,6 +3073,152 @@ class Router:
 
 # ---------------------------------------------------------------- http
 
+# ---------------------------------------------------------------- activity (model timeline + per-request stats)
+
+ACTIVITY_MAX_EVENTS = 2000
+ACTIVITY_MAX_REQUESTS = 2000
+ACTIVITY_SAVE_EVERY_S = 30
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if isinstance(x, (int, float)) and not isinstance(x, bool))
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def summarize_activity(events, requests, since=0.0):
+    """Pure. Per profile over [since, now]: requests, tokens, average and median tok/s, median time to first
+    token, number of loads and average load time (a 'starting' event followed by 'running' for the same profile).
+    Never raises on junk records."""
+    acc = {}
+
+    def slot(name):
+        return acc.setdefault(name, {"requests": 0, "tokens": 0, "tps": [], "ttft": [], "loads": 0, "load_s": []})
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)  # noqa: E731
+    try:
+        for r in requests or []:
+            if not isinstance(r, dict) or not num(r.get("t1")) or r["t1"] < since:
+                continue
+            s = slot(str(r.get("profile") or "?"))
+            s["requests"] += 1
+            if num(r.get("tokens")):
+                s["tokens"] += int(r["tokens"])
+            if num(r.get("tps")):
+                s["tps"].append(r["tps"])
+            if num(r.get("ttft")):
+                s["ttft"].append(r["ttft"])
+        pend = None
+        for e in sorted((e for e in events or [] if isinstance(e, dict) and num(e.get("t"))), key=lambda e: e["t"]):
+            st, pr = e.get("state"), e.get("profile")
+            if st == "starting" and pr:
+                pend = (pr, e["t"])
+            elif st == "running" and pend and pend[0] == pr:
+                if e["t"] >= since:
+                    s = slot(str(pr))
+                    s["loads"] += 1
+                    s["load_s"].append(e["t"] - pend[1])
+                pend = None
+            elif st not in ("starting", "running"):
+                pend = None          # a failed, stopped or offline load does not count
+    except Exception as e:  # noqa: BLE001 - junk in a persisted file must not break the page
+        log(f"summarize_activity: {type(e).__name__}: {e}")
+    out = {}
+    for name, s in acc.items():
+        out[name] = {"requests": s["requests"], "tokens": s["tokens"],
+                     "avg_tps": round(sum(s["tps"]) / len(s["tps"]), 2) if s["tps"] else None,
+                     "median_tps": round(_median(s["tps"]), 2) if s["tps"] else None,
+                     "median_ttft": round(_median(s["ttft"]), 2) if s["ttft"] else None,
+                     "loads": s["loads"],
+                     "avg_load_s": round(sum(s["load_s"]) / len(s["load_s"]), 1) if s["load_s"] else None}
+    return out
+
+
+class ActivityLog:
+    """Which profile was loading/running/stopped over time, plus one record per generation request
+    (profile, tokens, time to first token, tok/s). METADATA ONLY: no prompt or answer text is ever stored.
+    Kept in memory and saved to activity.json next to config.json (every 30 s and at shutdown)."""
+
+    def __init__(self, path=None, max_events=ACTIVITY_MAX_EVENTS, max_requests=ACTIVITY_MAX_REQUESTS):
+        self.path = path
+        self.lock = threading.Lock()
+        self.events = collections.deque(maxlen=max_events)
+        self.requests = collections.deque(maxlen=max_requests)
+        self._key = None
+        self._dirty = False
+        self._last_save = time.time()
+        self.load()
+
+    def load(self):
+        if not self.path:
+            return
+        num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)  # noqa: E731
+        try:
+            with open(self.path) as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            log(f"activity: could not read {self.path}: {e}")
+            return
+        if not isinstance(d, dict):
+            return
+        ev = [e for e in d.get("events") or [] if isinstance(e, dict) and num(e.get("t")) and isinstance(e.get("state"), str)]
+        rq = [r for r in d.get("requests") or [] if isinstance(r, dict) and num(r.get("t1"))]
+        self.events.extend(ev[-self.events.maxlen:])
+        self.requests.extend(rq[-self.requests.maxlen:])
+        sv = d.get("saved_at")
+        if self.events and num(sv) and sv >= self.events[-1]["t"]:
+            self.events.append({"t": sv, "state": "offline", "profile": None})   # the controller was down after this
+
+    def observe(self, state, profile, now=None):
+        key = (state, profile)
+        with self.lock:
+            if key == self._key:
+                return
+            self._key = key
+            self.events.append({"t": round(now if now is not None else time.time(), 3), "state": state, "profile": profile})
+            self._dirty = True
+
+    def request(self, rec):
+        with self.lock:
+            self.requests.append(rec)
+            self._dirty = True
+
+    def snapshot(self, since):
+        """(events, requests) for the window; the last event before `since` is kept so the window starts with a state."""
+        with self.lock:
+            ev, rq = list(self.events), list(self.requests)
+        before = [e for e in ev if e["t"] <= since]
+        return (before[-1:] + [e for e in ev if e["t"] > since]), [r for r in rq if r.get("t1", 0) >= since]
+
+    def api(self, hours, state=None, profile=None):
+        now = time.time()
+        since = now - hours * 3600
+        ev, rq = self.snapshot(since)
+        return {"now": round(now, 3), "since": round(since, 3), "state": state, "profile": profile, "events": ev,
+                "requests": rq[-500:], "request_count": len(rq), "profiles": summarize_activity(ev, rq, since)}
+
+    def maybe_save(self, force=False):
+        if not self.path:
+            return
+        with self.lock:
+            if not (self._dirty or force):
+                return
+            if not force and time.time() - self._last_save < ACTIVITY_SAVE_EVERY_S:
+                return
+            data = {"saved_at": round(time.time(), 3), "events": list(self.events), "requests": list(self.requests)}
+            self._dirty, self._last_save = False, time.time()
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log(f"activity: could not save {self.path}: {e}")
+
+
 class Sampler:
     """Background 1 s sampler feeding /api/metrics: RAM, per-NUMA used, GPUs, per-core CPU, child RSS."""
 
@@ -3130,6 +3286,10 @@ class Sampler:
                 s = self.sample()
                 with self.lock:
                     self.samples.append(s)
+                act = getattr(self.sup, "activity", None)
+                if act is not None:
+                    act.observe(self.sup.state, self.sup.serving())
+                    act.maybe_save()
             except Exception as e:  # noqa: BLE001 - sampler must survive anything
                 log(f"sampler: {e}")
             time.sleep(max(0.05, self.interval - (time.time() - t0)))
@@ -3457,6 +3617,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 d["gpu"] = gp[d["index"]] if d.get("index") is not None and d["index"] < len(gp) else None
             lm.update(state=sup.state, running_gpus=gp, placement=sup.placement_info())
             return self.send_json(lm)
+        if path == "/api/activity" and method == "GET":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                hours = max(0.05, min(float((q.get("hours") or ["24"])[0]), 24 * 30))
+            except ValueError:
+                hours = 24.0
+            return self.send_json(self.server.activity.api(hours, sup.state, sup.serving()))
         if path == "/api/metrics" and method == "GET":
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try:
@@ -3924,6 +4091,7 @@ def main():
     srv.cfg, srv.sup, srv.kev, srv.router = cfg, sup, kev, router
     srv.dl = Downloader(cfg)
     srv.updater = Updater(HERE, sup)
+    srv.activity = sup.activity = ActivityLog(os.path.join(os.path.dirname(os.path.abspath(cfg.path)), "activity.json"))
     srv.sampler = Sampler(sup)
     srv.sampler.start()
 
@@ -3932,6 +4100,7 @@ def main():
         sup.stop("controller exit")
         kev.stop("controller exit")
         srv.dl.shutdown()
+        srv.activity.maybe_save(force=True)
         os._exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)

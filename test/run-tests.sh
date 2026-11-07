@@ -90,7 +90,7 @@ python3 "$D/test/test_metrics.py" > "$T/unit.log" 2>&1; UR=$?
 grep -E "^(PASS|FAIL)" "$T/unit.log" | grep -c PASS | sed 's/^/unit checks passed: /'
 grep FAIL "$T/unit.log" | head -5; tail -3 "$T/unit.log" | grep -i "traceback\|error"
 ok "unit tests exit 0" $([ $UR = 0 ] && echo 1 || echo 0)
-for U in test_modelnames test_loadmap test_gen test_placement test_system test_library test_download test_update test_helpers; do
+for U in test_modelnames test_loadmap test_gen test_placement test_system test_library test_download test_update test_helpers test_activity; do
   python3 "$D/test/$U.py" > "$T/$U.log" 2>&1; UR=$?
   grep -c "^PASS" "$T/$U.log" | sed "s/^/$U checks passed: /"
   grep "^FAIL" "$T/$U.log" | head -5
@@ -446,7 +446,14 @@ ok "request for the loaded profile is served immediately while another waits" $(
 wait $S1 $W2
 ok "the waiter switched only after the 1gpu requests ended" $([ "$(cat "$T/w2.out")" = "200 qwen36-2gpu" ] && grep -q DONE "$T/s1.out" && echo 1 || echo 0)
 H4 $B4/api/status | j "print('final',d['server']['profile'],d['server']['inflight'])"
+echo "--- activity: /api/activity needs login, records requests + state changes, is saved at shutdown"
+ok "/api/activity needs the login" $([ "$(curl -s -o /dev/null -w '%{http_code}' $B4/api/activity)" = 401 ] && echo 1 || echo 0)
+H4 "$B4/api/activity?hours=1" | j "r=d['requests']; print('act', len(r) >= 1, all(x.get('profile') and x.get('t1') for x in r), bool(d['profiles']), len(d['events']) >= 1, sorted(d)[:3])" | tee "$T/o"
+ok "activity: requests, profiles and events are present" $(grep -q "^act True True True True" "$T/o" && echo 1 || echo 0)
+ok "activity: a bad hours value still answers 200" $([ "$(H4 -o /dev/null -w '%{http_code}' "$B4/api/activity?hours=abc")" = 200 ] && echo 1 || echo 0)
+rm -f "$T/activity.json"
 kill $CTL4; sleep 1
+ok "activity.json is written at shutdown and holds request metadata only" $(python3 -c "import json,sys;d=json.load(open('$T/activity.json'));r=d['requests'];print(int(len(r)>=1 and all(set(x)<={'t0','t1','profile','tokens','ttft','tps'} for x in r)))" 2>/dev/null || echo 0)
 echo "--- require_api_key false: /v1 open without a key, admin pages still locked"
 python3 - "$T/config.json" "$T/config5.json" <<'EOF7'
 import json,sys
